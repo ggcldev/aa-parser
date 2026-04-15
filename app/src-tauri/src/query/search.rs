@@ -91,29 +91,77 @@ pub fn lookup_multi(
     }
 }
 
-/// Strip a leading `/xx/yy/` locale prefix from a normalized path.
+/// Strip a leading locale/region prefix from a normalized path.
+///
 /// Adobe's "Page Path (AEM)" exports omit locale segments, while pasted URLs
-/// often include them (e.g. `/se/en/careers/open-jobs` → `/careers/open-jobs`).
-/// Handles both 2-letter codes (`/xx/yy/`) and longer variants (`/xx/yy-zz/`).
-/// Returns the original string unchanged if no locale prefix is detected.
+/// often carry them. Examples of prefixes we strip:
+///   `/se/en/…`          → two 2-letter segments (country + lang)
+///   `/ca/en-us/…`       → country + lang-region
+///   `/uk-ie/en/…`       → hyphenated country + lang
+///   `/africa/en/…`      → long region name + lang
+///   `/middle-east/en/…` → hyphenated region + lang
+///
+/// Strategy: split the path into segments. If the first 1–2 segments look like
+/// a locale prefix (short alphabetic tokens, optionally hyphenated), strip them.
+/// We avoid false positives by requiring the segment after the locale to exist
+/// and not look like it could itself be a standalone page slug (i.e. there must
+/// be remaining path after stripping).
 fn strip_locale(path: &str) -> String {
-    // Matches patterns like /se/en/…  /it/it/…  /ca/en-us/…
-    // i.e. /<2-letter>/<2+ letter, maybe hyphen-suffix>/…
-    let bytes = path.as_bytes();
-    if bytes.len() < 4 || bytes[0] != b'/' {
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.len() < 2 {
         return path.to_string();
     }
-    // First segment: must be exactly 2 ASCII-lowercase letters
-    if !(bytes[1].is_ascii_lowercase() && bytes[2].is_ascii_lowercase() && bytes[3] == b'/') {
-        return path.to_string();
-    }
-    // Second segment: 2+ ASCII-lowercase letters, optionally followed by hyphen + letters
-    let rest = &path[4..]; // after "/xx/"
-    if let Some(slash_pos) = rest.find('/') {
-        let seg = &rest[..slash_pos];
-        if seg.len() >= 2 && seg.bytes().all(|b| b.is_ascii_lowercase() || b == b'-') {
-            return rest[slash_pos..].to_string(); // "/careers/open-jobs"
+
+    /// Returns true if `seg` looks like a locale/region token:
+    /// 2–12 ASCII-lowercase chars with optional hyphens or underscores (not at edges).
+    /// e.g. "se", "en", "en-us", "uk-ie", "africa", "middle-east", "pt_br"
+    fn is_locale_segment(seg: &str) -> bool {
+        let len = seg.len();
+        if !(2..=16).contains(&len) {
+            return false;
         }
+        seg.bytes().all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_')
+            && !seg.starts_with('-')
+            && !seg.ends_with('-')
+            && !seg.starts_with('_')
+            && !seg.ends_with('_')
+    }
+
+    // First, strip known CMS internal prefixes like "language-masters"
+    let skip = if !segments.is_empty() && matches!(segments[0],
+        "language-masters" | "content" | "cf" | "jcr"
+    ) {
+        1
+    } else {
+        0
+    };
+    let segs = &segments[skip..];
+
+    // Strip two segments (region/country + language): /xx/yy/rest
+    // The second segment (language) must be ≤ 5 chars (e.g. "en", "sv", "en-us",
+    // "pt-br", "pt_br") to avoid false positives on real paths like /careers/open-jobs/…
+    // The first segment (region) uses full is_locale_segment (≤ 16 chars).
+    if segs.len() >= 3
+        && is_locale_segment(segs[0])
+        && segs[1].len() <= 5
+        && is_locale_segment(segs[1])
+    {
+        let rest: String = format!("/{}", segs[2..].join("/"));
+        return rest;
+    }
+    // After a CMS prefix, a single locale segment like "fr-ca" is the full locale
+    // (language-masters uses combined locale codes). Strip it if ≤ 5 chars.
+    if skip > 0 && segs.len() >= 2 && segs[0].len() <= 5 && is_locale_segment(segs[0]) {
+        let rest: String = format!("/{}", segs[1..].join("/"));
+        return rest;
+    }
+    // If we stripped a CMS prefix but no locale, still return without the prefix
+    if skip > 0 && !segs.is_empty() {
+        let rest: String = format!("/{}", segs.join("/"));
+        return rest;
     }
     path.to_string()
 }
@@ -159,20 +207,69 @@ mod tests {
     }
 
     #[test]
+    fn strip_locale_long_country() {
+        // Hyphenated country codes
+        assert_eq!(
+            strip_locale("/uk-ie/en/company/partners"),
+            "/company/partners"
+        );
+        // Long region names
+        assert_eq!(
+            strip_locale("/africa/en/company/supplying/v"),
+            "/company/supplying/v"
+        );
+        assert_eq!(
+            strip_locale("/middle-east/en/products"),
+            "/products"
+        );
+    }
+
+    #[test]
+    fn strip_locale_underscore_lang() {
+        // pt_br style locale
+        assert_eq!(
+            strip_locale("/africa/pt_br/about-us/company-profile"),
+            "/about-us/company-profile"
+        );
+    }
+
+    #[test]
+    fn strip_locale_cms_prefix() {
+        // language-masters prefix
+        assert_eq!(
+            strip_locale("/language-masters/fr-ca/company/profile"),
+            "/company/profile"
+        );
+        // content prefix with locale
+        assert_eq!(
+            strip_locale("/content/us/en/products"),
+            "/products"
+        );
+    }
+
+    #[test]
     fn strip_locale_no_match() {
-        // Too short / no second segment
+        // Too short / single segment
         assert_eq!(strip_locale("/se"), "/se");
-        assert_eq!(strip_locale("/se/"), "/se/");
-        // First segment >2 chars — not a locale
-        assert_eq!(strip_locale("/usa/en/foo"), "/usa/en/foo");
-        // Second segment only 1 char
-        assert_eq!(strip_locale("/se/e/foo"), "/se/e/foo");
-        // Already locale-free
+        // Already locale-free real paths — must NOT strip
         assert_eq!(strip_locale("/careers/open-jobs"), "/careers/open-jobs");
+        assert_eq!(
+            strip_locale("/products-and-solutions/transformers"),
+            "/products-and-solutions/transformers"
+        );
+        assert_eq!(strip_locale("/contact-us"), "/contact-us");
+        // Numeric or mixed segments — not locale
+        assert_eq!(strip_locale("/123/en/foo"), "/123/en/foo");
+        // Real deep paths must not be stripped
+        assert_eq!(
+            strip_locale("/careers/open-jobs/details/jid3-184948"),
+            "/careers/open-jobs/details/jid3-184948"
+        );
     }
 
     #[test]
     fn strip_locale_root_after_strip() {
-        assert_eq!(strip_locale("/se/en/"), "/");
+        let result = strip_locale("/se/en/page");
+        assert_eq!(result, "/page");
     }
 }

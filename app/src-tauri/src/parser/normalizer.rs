@@ -12,8 +12,24 @@ pub fn normalize_url(input: &str) -> String {
         return String::new();
     }
 
+    // Strip invisible Unicode characters that sometimes appear in copy-pasted
+    // URLs (zero-width space, BOM, soft hyphen, directional marks, etc.).
+    let cleaned: String = trimmed
+        .chars()
+        .filter(|c| !matches!(c,
+            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' |
+            '\u{00AD}' | '\u{200E}' | '\u{200F}' | '\u{2028}' |
+            '\u{2029}' | '\u{202A}' | '\u{202B}' | '\u{202C}' |
+            '\u{202D}' | '\u{202E}' | '\u{2060}' | '\u{2061}' |
+            '\u{2062}' | '\u{2063}' | '\u{2064}' | '\u{FFFE}'
+        ))
+        .collect();
+    if cleaned.is_empty() {
+        return String::new();
+    }
+
     // Strip fragment first regardless of form.
-    let no_frag = trimmed.split('#').next().unwrap_or(trimmed);
+    let no_frag = cleaned.split('#').next().unwrap_or(&cleaned);
 
     let with_scheme: String = if no_frag.starts_with("http://") || no_frag.starts_with("https://") {
         no_frag.to_string()
@@ -129,5 +145,24 @@ mod tests {
     #[test]
     fn double_slash() {
         assert_eq!(normalize_url("/foo//bar"), normalize_url("/foo/bar"));
+    }
+
+    #[test]
+    fn invisible_unicode_stripped() {
+        // Zero-width space embedded in URL
+        assert_eq!(
+            normalize_url("https://www.example.com/foo\u{200B}"),
+            normalize_url("/foo")
+        );
+        // BOM in the middle
+        assert_eq!(
+            normalize_url("/careers/open\u{FEFF}-jobs"),
+            normalize_url("/careers/open-jobs")
+        );
+        // Soft hyphen
+        assert_eq!(
+            normalize_url("/about\u{00AD}us"),
+            normalize_url("/aboutus")
+        );
     }
 }
