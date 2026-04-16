@@ -8,6 +8,8 @@ pub struct Mapping {
     /// is the dimension name pulled from the first data row, used as the URL
     /// column header.
     pub url_header_override: Option<String>,
+    /// Warnings surfaced to the UI when URL-column selection was ambiguous.
+    pub warnings: Vec<String>,
 }
 
 const URL_ALIASES: &[&str] = &[
@@ -46,6 +48,7 @@ fn looks_like_url(s: &str) -> bool {
 pub fn map(headers: &[String], first_row: Option<&Vec<String>>) -> Mapping {
     let mut url_header_override: Option<String> = None;
     let mut skip_first_data_row = false;
+    let mut warnings = Vec::new();
 
     let mut effective_headers: Vec<String> = headers.to_vec();
 
@@ -81,25 +84,60 @@ pub fn map(headers: &[String], first_row: Option<&Vec<String>>) -> Mapping {
 
     // 2) Header alias match.
     if url_idx.is_none() {
-        url_idx = URL_ALIASES
+        let exact_candidates: Vec<usize> = normalized
             .iter()
-            .find_map(|alias| normalized.iter().position(|h| h == alias));
+            .enumerate()
+            .filter_map(|(idx, header)| URL_ALIASES.contains(&header.as_str()).then_some(idx))
+            .collect();
+        if let Some(first) = exact_candidates.first().copied() {
+            url_idx = Some(first);
+            if exact_candidates.len() > 1 {
+                warnings.push(ambiguous_header_warning(&effective_headers, &exact_candidates, first));
+            }
+        }
     }
 
     // 3) Header substring match.
     if url_idx.is_none() {
-        url_idx = normalized
+        let substring_candidates: Vec<usize> = normalized
             .iter()
-            .position(|h| h.contains("url") || h.contains("page") || h.contains("path") || h.contains("address"));
+            .enumerate()
+            .filter_map(|(idx, header)| {
+                (header.contains("url")
+                    || header.contains("page")
+                    || header.contains("path")
+                    || header.contains("address"))
+                .then_some(idx)
+            })
+            .collect();
+        if let Some(first) = substring_candidates.first().copied() {
+            url_idx = Some(first);
+            if substring_candidates.len() > 1 {
+                warnings.push(ambiguous_header_warning(
+                    &effective_headers,
+                    &substring_candidates,
+                    first,
+                ));
+            }
+        }
     }
 
     // 4) Content-based fallback: pick the column whose values look like URLs.
     if url_idx.is_none() {
         if let Some(fr) = first_row {
-            for (i, cell) in fr.iter().enumerate() {
-                if looks_like_url(cell) {
-                    url_idx = Some(i);
-                    break;
+            let content_candidates: Vec<usize> = fr
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, cell)| looks_like_url(cell).then_some(idx))
+                .collect();
+            if let Some(first) = content_candidates.first().copied() {
+                url_idx = Some(first);
+                if content_candidates.len() > 1 {
+                    warnings.push(ambiguous_header_warning(
+                        &effective_headers,
+                        &content_candidates,
+                        first,
+                    ));
                 }
             }
         }
@@ -123,10 +161,34 @@ pub fn map(headers: &[String], first_row: Option<&Vec<String>>) -> Mapping {
         metrics,
         skip_first_data_row,
         url_header_override,
+        warnings,
     }
 }
 
 fn is_numeric(s: &str) -> bool {
     let t = s.trim().replace(',', "").replace('%', "");
     !t.is_empty() && t.parse::<f64>().is_ok()
+}
+
+fn ambiguous_header_warning(headers: &[String], candidates: &[usize], chosen: usize) -> String {
+    let labels = candidates
+        .iter()
+        .map(|idx| {
+            headers
+                .get(*idx)
+                .map(|header| format!("'{}'", header.trim()))
+                .unwrap_or_else(|| format!("column {}", idx + 1))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let chosen_label = headers
+        .get(chosen)
+        .map(|header| format!("'{}'", header.trim()))
+        .unwrap_or_else(|| format!("column {}", chosen + 1));
+
+    format!(
+        "multiple URL-like columns detected ({}); using {}",
+        labels, chosen_label
+    )
 }

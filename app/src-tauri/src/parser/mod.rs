@@ -340,6 +340,7 @@ fn classify_export_profile(
 
     let mut full = 0usize;
     let mut path = 0usize;
+    let total = sample_values.len();
     for value in sample_values {
         let trimmed = value.trim().to_ascii_lowercase();
         if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -349,14 +350,14 @@ fn classify_export_profile(
         }
     }
 
-    if full > 0 && path == 0 {
+    if full.saturating_mul(2) > total {
         if query_rows.saturating_mul(100) / full.max(1) >= 25 {
             return ExportProfile::FullUrlWithQuery;
         }
         return ExportProfile::FullUrl;
     }
 
-    if path > 0 && full == 0 {
+    if path.saturating_mul(2) > total {
         return ExportProfile::PathOnly;
     }
 
