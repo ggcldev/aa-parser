@@ -1,4 +1,4 @@
-use aa_parser_lib::__dbg::{import_path, normalize_url};
+use aa_parser_lib::__dbg::{build_match_forms, import_path};
 use std::env;
 
 fn main() {
@@ -10,12 +10,30 @@ fn main() {
     println!("url col: {}", import.summary.url_column);
     println!("metrics: {:?}", import.summary.metric_columns);
     println!("warnings: {:?}", import.summary.warnings);
+    println!("url kind: {:?}", import.url_kind);
+    println!("profile: {:?}", import.export_profile);
+    println!("truncation cap: {:?}", import.summary.truncation_cap);
 
     println!("\n== first 5 rows ==");
     for r in import.rows.iter().take(5) {
         println!("source: {}", r.source_url);
-        println!("normalized: {}", r.normalized_url);
-        println!("metrics: {:?}", r.metrics);
+        println!("path: {}", r.path_key);
+        println!(
+            "normalized: {}",
+            r.normalized_url_key.as_deref().unwrap_or("—")
+        );
+        println!(
+            "identity: {}",
+            r.page_identity_key.as_deref().unwrap_or("—")
+        );
+        let metrics: Vec<_> = import
+            .summary
+            .metric_columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, name)| r.metric_values.get(idx).map(|value| (name, value)))
+            .collect();
+        println!("metrics: {:?}", metrics);
         println!("---");
     }
 
@@ -27,10 +45,16 @@ fn main() {
         "/about-us/company-profile",
     ];
     for q in queries {
-        let n = normalize_url(q);
-        let hit = import.by_normalized.get(&n);
+        let forms = build_match_forms(q);
+        let full_hits = forms
+            .normalized_url_key
+            .as_ref()
+            .and_then(|key| import.by_normalized_url.get(key))
+            .map(|rows| rows.len());
+        let path_hits = import.by_path.get(&forms.path_key).map(|rows| rows.len());
         println!("query: {}", q);
-        println!("  normalized: {}", n);
-        println!("  hit: {:?}", hit.map(|v| v.len()));
+        println!("  path: {}", forms.path_key);
+        println!("  full hits: {:?}", full_hits);
+        println!("  path hits: {:?}", path_hits);
     }
 }

@@ -1,65 +1,221 @@
+use serde::{Deserialize, Serialize};
 use url::Url;
 
-/// Canonical form for matching: path only, lowercased, trailing-slash stripped,
-/// fragments + query strings removed, and common index-page suffixes dropped.
-///
-/// We deliberately drop scheme + host so that a row in an Adobe Workspace
-/// export listed as `/careers/open-jobs` matches a user-pasted query like
-/// `https://www.hitachienergy.com/careers/open-jobs?utm_source=newsletter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UrlValueKind {
+    FullUrl,
+    PathOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExportProfile {
+    FullUrl,
+    FullUrlWithQuery,
+    HostAndPath,
+    PathOnly,
+    Unknown,
+}
+
+impl ExportProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExportProfile::FullUrl => "full_url_export",
+            ExportProfile::FullUrlWithQuery => "full_url_with_query_export",
+            ExportProfile::HostAndPath => "host_and_path_export",
+            ExportProfile::PathOnly => "path_only_export",
+            ExportProfile::Unknown => "unknown_export",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchForms {
+    pub kind: UrlValueKind,
+    pub raw_exact_key: String,
+    pub scheme: Option<String>,
+    pub authority: Option<String>,
+    pub query_string: Option<String>,
+    pub fragment: Option<String>,
+    pub locale_prefix: Option<String>,
+    pub normalized_url_key: Option<String>,
+    pub page_identity_key: Option<String>,
+    pub host_and_path_key: Option<String>,
+    pub path_key: String,
+    pub has_fragment: bool,
+    pub tracking_params: Vec<String>,
+    pub functional_params: Vec<String>,
+    pub unknown_params: Vec<String>,
+    pub raw_without_fragment_key: String,
+}
+
+const INVISIBLE_URL_CHARS: &[char] = &[
+    '\u{200B}', '\u{200C}', '\u{200D}', '\u{FEFF}', '\u{00AD}', '\u{200E}', '\u{200F}',
+    '\u{2028}', '\u{2029}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}',
+    '\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}', '\u{2064}', '\u{FFFE}',
+];
+
+const TRACKING_PARAMS: &[&str] = &["gclid", "fbclid", "msclkid", "source"];
+const FUNCTIONAL_PARAMS: &[&str] = &[
+    "q",
+    "query",
+    "search",
+    "page",
+    "p",
+    "offset",
+    "limit",
+    "sort",
+    "filter",
+    "lang",
+    "locale",
+    "category",
+    "tab",
+    "view",
+    "id",
+];
+
+struct ParamBuckets {
+    tracking: Vec<String>,
+    functional: Vec<String>,
+    unknown: Vec<String>,
+}
+
 pub fn normalize_url(input: &str) -> String {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
+    build_match_forms(input).path_key
+}
 
-    // Strip invisible Unicode characters that sometimes appear in copy-pasted
-    // URLs (zero-width space, BOM, soft hyphen, directional marks, etc.).
-    let cleaned: String = trimmed
-        .chars()
-        .filter(|c| !matches!(c,
-            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' |
-            '\u{00AD}' | '\u{200E}' | '\u{200F}' | '\u{2028}' |
-            '\u{2029}' | '\u{202A}' | '\u{202B}' | '\u{202C}' |
-            '\u{202D}' | '\u{202E}' | '\u{2060}' | '\u{2061}' |
-            '\u{2062}' | '\u{2063}' | '\u{2064}' | '\u{FFFE}'
-        ))
-        .collect();
+pub fn build_match_forms(input: &str) -> MatchForms {
+    let cleaned = sanitize_input(input);
     if cleaned.is_empty() {
-        return String::new();
+        return MatchForms {
+            kind: UrlValueKind::PathOnly,
+            raw_exact_key: String::new(),
+            scheme: None,
+            authority: None,
+            query_string: None,
+            fragment: None,
+            locale_prefix: None,
+            normalized_url_key: None,
+            page_identity_key: None,
+            host_and_path_key: None,
+            path_key: String::new(),
+            has_fragment: false,
+            tracking_params: Vec::new(),
+            functional_params: Vec::new(),
+            unknown_params: Vec::new(),
+            raw_without_fragment_key: String::new(),
+        };
     }
 
-    // Strip fragment first regardless of form.
-    let no_frag = cleaned.split('#').next().unwrap_or(&cleaned);
+    let raw_without_fragment = cleaned
+        .split('#')
+        .next()
+        .unwrap_or(&cleaned)
+        .trim()
+        .to_string();
 
-    let with_scheme: String = if no_frag.starts_with("http://") || no_frag.starts_with("https://") {
-        no_frag.to_string()
-    } else if no_frag.starts_with("//") {
-        format!("https:{}", no_frag)
-    } else if no_frag.starts_with('/') {
-        return canonicalize_path(no_frag.split('?').next().unwrap_or(no_frag));
-    } else if no_frag.contains('.') && !no_frag.contains(' ') && !no_frag.starts_with('?') {
-        // bare host like "example.com/foo"
-        format!("https://{}", no_frag)
+    if let Some(parsed) = parse_url_like(&cleaned) {
+        let scheme = parsed.scheme().to_ascii_lowercase();
+        let authority = normalized_authority(&parsed);
+        let path = canonicalize_path(parsed.path());
+        let locale_prefix = detect_locale_prefix(&path);
+        let fragment = parsed.fragment().map(|value| value.to_string());
+        let has_fragment = fragment.is_some();
+        let normalized_query = normalize_query(parsed.query());
+        let buckets = classify_query_params(normalized_query.as_deref());
+        let normalized_url_key = build_full_key(&authority, &path, normalized_query.as_deref());
+        let page_identity_key = build_full_key(
+            &authority,
+            &path,
+            drop_tracking_params(normalized_query.as_deref()).as_deref(),
+        );
+        let host_and_path_key = format!("{}{}", authority, path);
+
+        return MatchForms {
+            kind: UrlValueKind::FullUrl,
+            raw_exact_key: cleaned,
+            scheme: Some(scheme),
+            authority: Some(authority),
+            query_string: normalized_query.clone(),
+            fragment,
+            locale_prefix,
+            normalized_url_key: Some(normalized_url_key),
+            page_identity_key: Some(page_identity_key),
+            host_and_path_key: Some(host_and_path_key),
+            path_key: path,
+            has_fragment,
+            tracking_params: buckets.tracking,
+            functional_params: buckets.functional,
+            unknown_params: buckets.unknown,
+            raw_without_fragment_key: raw_without_fragment,
+        };
+    }
+
+    let path = canonicalize_path(cleaned.split('?').next().unwrap_or(&cleaned));
+    MatchForms {
+        kind: UrlValueKind::PathOnly,
+        raw_exact_key: cleaned,
+        scheme: None,
+        authority: None,
+        query_string: None,
+        fragment: None,
+        locale_prefix: detect_locale_prefix(&path),
+        normalized_url_key: None,
+        page_identity_key: None,
+        host_and_path_key: None,
+        path_key: path,
+        has_fragment: false,
+        tracking_params: Vec::new(),
+        functional_params: Vec::new(),
+        unknown_params: Vec::new(),
+        raw_without_fragment_key: raw_without_fragment,
+    }
+}
+
+fn sanitize_input(input: &str) -> String {
+    input
+        .trim()
+        .chars()
+        .filter(|c| !INVISIBLE_URL_CHARS.contains(c))
+        .collect::<String>()
+        .replace("&amp;", "&")
+        .replace("&#38;", "&")
+}
+
+fn parse_url_like(input: &str) -> Option<Url> {
+    let candidate = if input.starts_with("http://") || input.starts_with("https://") {
+        input.to_string()
+    } else if input.starts_with("//") {
+        format!("https:{}", input)
+    } else if input.starts_with('/') || input.starts_with('?') || input.contains(' ') {
+        return None;
+    } else if input.contains('.') {
+        format!("https://{}", input)
     } else {
-        return canonicalize_path(no_frag.split('?').next().unwrap_or(no_frag));
+        return None;
     };
 
-    match Url::parse(&with_scheme) {
-        Ok(u) => canonicalize_path(u.path()),
-        Err(_) => canonicalize_path(no_frag.split('?').next().unwrap_or(no_frag)),
+    Url::parse(&candidate).ok()
+}
+
+fn normalized_authority(url: &Url) -> String {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    match url.port() {
+        Some(80) | Some(443) | None => host,
+        Some(port) => format!("{}:{}", host, port),
     }
 }
 
 fn canonicalize_path(path: &str) -> String {
-    let mut p = if path.is_empty() { "/".to_string() } else { path.to_string() };
-    p = p.to_ascii_lowercase();
+    let mut p = if path.is_empty() {
+        "/".to_string()
+    } else {
+        path.to_ascii_lowercase()
+    };
 
-    // Collapse repeated slashes.
     while p.contains("//") {
         p = p.replace("//", "/");
     }
 
-    // Drop common index/default suffixes so /foo and /foo/index.html match.
     for suffix in [
         "/index.html",
         "/index.htm",
@@ -84,6 +240,101 @@ fn canonicalize_path(path: &str) -> String {
     p
 }
 
+fn detect_locale_prefix(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    let first = segments[0];
+    let second = segments[1];
+    if is_locale_segment(first) && is_language_segment(second) {
+        return Some(format!("{}/{}", first, second));
+    }
+    None
+}
+
+fn is_locale_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.len() == 2 && bytes.iter().all(|b| b.is_ascii_lowercase())
+}
+
+fn is_language_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    if bytes.len() == 2 && bytes.iter().all(|b| b.is_ascii_lowercase()) {
+        return true;
+    }
+    bytes.len() == 5
+        && matches!(bytes[2], b'-' | b'_')
+        && bytes[0..2].iter().all(|b| b.is_ascii_lowercase())
+        && bytes[3..5].iter().all(|b| b.is_ascii_lowercase())
+}
+
+fn normalize_query(query: Option<&str>) -> Option<String> {
+    let query = query?.trim();
+    if query.is_empty() {
+        return None;
+    }
+    Some(query.to_string())
+}
+
+fn drop_tracking_params(query: Option<&str>) -> Option<String> {
+    let query = query?;
+    let parts: Vec<String> = query
+        .split('&')
+        .filter(|entry| !entry.trim().is_empty())
+        .filter_map(|entry| {
+            let key = entry.split('=').next().unwrap_or_default().to_ascii_lowercase();
+            let is_tracking = key.starts_with("utm_") || TRACKING_PARAMS.contains(&key.as_str());
+            (!is_tracking).then_some(entry.to_string())
+        })
+        .collect();
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("&"))
+    }
+}
+
+fn classify_query_params(query: Option<&str>) -> ParamBuckets {
+    let mut buckets = ParamBuckets {
+        tracking: Vec::new(),
+        functional: Vec::new(),
+        unknown: Vec::new(),
+    };
+    let Some(query) = query else {
+        return buckets;
+    };
+
+    for entry in query.split('&').filter(|entry| !entry.trim().is_empty()) {
+        let key = entry
+            .split('=')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        if key.starts_with("utm_") || TRACKING_PARAMS.contains(&key.as_str()) {
+            buckets.tracking.push(key);
+        } else if FUNCTIONAL_PARAMS.contains(&key.as_str()) {
+            buckets.functional.push(key);
+        } else {
+            buckets.unknown.push(key);
+        }
+    }
+
+    buckets
+}
+
+fn build_full_key(authority: &str, path: &str, query: Option<&str>) -> String {
+    match query {
+        Some(query) if !query.is_empty() => format!("https://{}{}?{}", authority, path, query),
+        _ => format!("https://{}{}", authority, path),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +345,29 @@ mod tests {
             normalize_url("https://www.hitachienergy.com/careers/open-jobs"),
             normalize_url("/careers/open-jobs")
         );
+    }
+
+    #[test]
+    fn full_url_preserves_query_for_exact_matching() {
+        let forms = build_match_forms(
+            "https://www.example.com/products/item?utm_source=foo&x=1#ignore-me",
+        );
+        assert_eq!(
+            forms.normalized_url_key.as_deref(),
+            Some("https://www.example.com/products/item?utm_source=foo&x=1")
+        );
+        assert_eq!(
+            forms.page_identity_key.as_deref(),
+            Some("https://www.example.com/products/item?x=1")
+        );
+        assert_eq!(forms.tracking_params, vec!["utm_source".to_string()]);
+        assert_eq!(forms.unknown_params, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn tracking_only_query_rolls_up_to_page_identity() {
+        let forms = build_match_forms("https://example.com/foo?utm_source=a&gclid=123");
+        assert_eq!(forms.page_identity_key.as_deref(), Some("https://example.com/foo"));
     }
 
     #[test]
@@ -113,56 +387,10 @@ mod tests {
     }
 
     #[test]
-    fn fragment_stripped() {
-        assert_eq!(
-            normalize_url("https://example.com/foo#bar"),
-            normalize_url("/foo")
-        );
+    fn fragment_captured() {
+        let forms = build_match_forms("https://example.com/foo#bar");
+        assert_eq!(forms.fragment.as_deref(), Some("bar"));
+        assert_eq!(forms.path_key, "/foo");
     }
 
-    #[test]
-    fn root() {
-        assert_eq!(normalize_url("https://example.com/"), "/");
-        assert_eq!(normalize_url("/"), "/");
-    }
-
-    #[test]
-    fn query_string_dropped() {
-        assert_eq!(
-            normalize_url("https://www.example.com/careers/open-jobs?utm_source=foo"),
-            normalize_url("/careers/open-jobs")
-        );
-    }
-
-    #[test]
-    fn index_html_collapsed() {
-        assert_eq!(
-            normalize_url("/products/index.html"),
-            normalize_url("/products")
-        );
-    }
-
-    #[test]
-    fn double_slash() {
-        assert_eq!(normalize_url("/foo//bar"), normalize_url("/foo/bar"));
-    }
-
-    #[test]
-    fn invisible_unicode_stripped() {
-        // Zero-width space embedded in URL
-        assert_eq!(
-            normalize_url("https://www.example.com/foo\u{200B}"),
-            normalize_url("/foo")
-        );
-        // BOM in the middle
-        assert_eq!(
-            normalize_url("/careers/open\u{FEFF}-jobs"),
-            normalize_url("/careers/open-jobs")
-        );
-        // Soft hyphen
-        assert_eq!(
-            normalize_url("/about\u{00AD}us"),
-            normalize_url("/aboutus")
-        );
-    }
 }

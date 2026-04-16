@@ -1,275 +1,297 @@
 use crate::models::{LookupHit, LookupResponse, Row};
-use crate::parser::normalizer::normalize_url;
+use crate::parser::normalizer::{build_match_forms, ExportProfile};
 use crate::state::Import;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatchMode {
+    FullUrl,
+    Path,
+    Mixed,
+}
+
+impl MatchMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            MatchMode::FullUrl => "FULL_URL_MODE",
+            MatchMode::Path => "PATH_MODE",
+            MatchMode::Mixed => "MIXED_MODE",
+        }
+    }
+}
 
 pub fn lookup_multi(
     imports: &[&Import],
     queries: &[String],
     requested_metrics: &[String],
+    match_mode_override: Option<String>,
 ) -> LookupResponse {
     let mut hits = Vec::with_capacity(queries.len());
+    let requested_missing = missing_metrics(imports, requested_metrics);
 
-    for q in queries {
-        let q_trim = q.trim();
-        if q_trim.is_empty() {
+    for query in queries {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        let normalized = normalize_url(q_trim);
-        // Alternate: strip `/xx/yy/` locale prefix. Adobe's "Page Path (AEM)"
-        // export has paths without locale (e.g. `/careers/open-jobs`), while
-        // pasted URLs often carry `/se/en/…`, `/it/it/…`, etc. We try both.
-        let stripped = strip_locale(&normalized);
-        let candidates: Vec<&str> = if stripped != normalized {
-            vec![normalized.as_str(), stripped.as_str()]
-        } else {
-            vec![normalized.as_str()]
-        };
 
-        let mut all_rows: Vec<Row> = Vec::new();
+        let forms = build_match_forms(trimmed);
+        let mut all_rows = Vec::new();
+        let mut effective_modes = Vec::new();
+        let mut invalid_url_for_full_mode = false;
+        let mut mixed_mode_blocked = false;
+
         for import in imports {
-            let mut matched_idxs: Option<&Vec<usize>> = None;
-            for cand in &candidates {
-                if let Some(idxs) = import.by_normalized.get(*cand) {
-                    matched_idxs = Some(idxs);
-                    break;
+            let mode = effective_mode(import, match_mode_override.as_deref());
+            effective_modes.push(mode.as_str().to_string());
+
+            match mode {
+                MatchMode::Mixed => {
+                    mixed_mode_blocked = true;
                 }
-                // Truncation-prefix fallback: Adobe caps dimension values at
-                // a fixed length (commonly 100). If the candidate is longer,
-                // try the cap-length prefix.
-                let q_len = cand.chars().count();
-                for &cap in &import.truncation_lens {
-                    if q_len > cap {
-                        let prefix: String = cand.chars().take(cap).collect();
-                        if let Some(idxs) = import.by_normalized.get(&prefix) {
-                            matched_idxs = Some(idxs);
-                            break;
-                        }
+                MatchMode::FullUrl => {
+                    let Some(full_key) = forms.normalized_url_key.as_ref() else {
+                        invalid_url_for_full_mode = true;
+                        continue;
+                    };
+                    let ids = import
+                        .by_normalized_url
+                        .get(full_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    if !ids.is_empty() {
+                        all_rows.extend(materialize_rows(
+                            import,
+                            ids,
+                            requested_metrics,
+                            "EXACT_FULL_URL_MATCH",
+                        ));
                     }
                 }
-                if matched_idxs.is_some() {
-                    break;
-                }
-            }
-            if let Some(idxs) = matched_idxs {
-                for i in idxs {
-                    let mut row = filter_row(&import.rows[*i], requested_metrics);
-                    row.source_file = Some(import.summary.file_name.clone());
-                    row.batch_id = Some(import.summary.batch_id.clone());
-                    all_rows.push(row);
+                MatchMode::Path => {
+                    let ids = import
+                        .by_path
+                        .get(&forms.path_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    if !ids.is_empty() {
+                        all_rows.extend(materialize_rows(
+                            import,
+                            ids,
+                            requested_metrics,
+                            "EXACT_PATH_MATCH",
+                        ));
+                    }
                 }
             }
         }
 
-        let match_count = all_rows.len();
+        let mut notes = Vec::new();
+        if !requested_missing.is_empty() {
+            notes.push(format!(
+                "Missing metric in export: {}",
+                requested_missing.join(", ")
+            ));
+        }
+
+        let unique_modes = dedup(effective_modes);
+        let mode_label = if unique_modes.len() == 1 {
+            unique_modes[0].clone()
+        } else {
+            "MIXED_MODE".to_string()
+        };
+
+        let (status, matched, ambiguous, match_type, confidence) = if mixed_mode_blocked
+            && match_mode_override.is_none()
+        {
+            (
+                "Mixed export format".to_string(),
+                false,
+                false,
+                "NO_MATCH".to_string(),
+                0.0,
+            )
+        } else if invalid_url_for_full_mode && all_rows.is_empty() {
+            (
+                "Invalid URL".to_string(),
+                false,
+                false,
+                "NO_MATCH".to_string(),
+                0.0,
+            )
+        } else if all_rows.is_empty() {
+            (
+                "No exact match found".to_string(),
+                false,
+                false,
+                "NO_MATCH".to_string(),
+                0.0,
+            )
+        } else if all_rows.len() > 1 {
+            (
+                "Duplicate exact matches found".to_string(),
+                false,
+                true,
+                "EXACT_DUPLICATE".to_string(),
+                1.0,
+            )
+        } else {
+            ("Matched".to_string(), true, false, "EXACT_MATCH".to_string(), 1.0)
+        };
+
+        if status == "Mixed export format" {
+            notes.push(
+                "Choose FULL_URL_MODE or PATH_MODE manually for mixed Adobe exports.".to_string(),
+            );
+        }
+
         hits.push(LookupHit {
-            query: q.clone(),
-            normalized_query: normalized,
-            matched: match_count > 0,
-            ambiguous: match_count > 1,
-            match_count,
+            query: query.clone(),
+            normalized_query: forms.path_key.clone(),
+            match_mode: mode_label,
+            status,
+            notes: notes.join(" · "),
+            matched,
+            ambiguous,
+            match_count: all_rows.len(),
+            match_type,
+            match_confidence: confidence,
+            export_profile: summarize_profiles(imports),
+            warnings: Vec::new(),
+            discarded_variants: Vec::new(),
+            query_input: query.clone(),
+            import_profile: summarize_profiles(imports),
+            confidence,
+            matched_row_id: all_rows.first().map(|row| row.raw_row_id),
+            matched_value: all_rows.first().map(|row| row.source_url.clone()),
+            alternatives: all_rows
+                .iter()
+                .skip(1)
+                .take(5)
+                .map(|row| row.source_url.clone())
+                .collect(),
             rows: all_rows,
         });
     }
 
-    let mut all_metrics: HashSet<&str> = HashSet::new();
-    for import in imports {
-        for m in &import.summary.metric_columns {
-            all_metrics.insert(m.as_str());
-        }
-    }
-    let missing_metrics: Vec<String> = requested_metrics
-        .iter()
-        .filter(|m| !all_metrics.contains(m.as_str()))
-        .cloned()
-        .collect();
-
     LookupResponse {
         hits,
-        missing_metrics,
+        missing_metrics: requested_missing,
         searched_files: imports.len(),
     }
 }
 
-/// Strip a leading locale/region prefix from a normalized path.
-///
-/// Adobe's "Page Path (AEM)" exports omit locale segments, while pasted URLs
-/// often carry them. Examples of prefixes we strip:
-///   `/se/en/…`          → two 2-letter segments (country + lang)
-///   `/ca/en-us/…`       → country + lang-region
-///   `/uk-ie/en/…`       → hyphenated country + lang
-///   `/africa/en/…`      → long region name + lang
-///   `/middle-east/en/…` → hyphenated region + lang
-///
-/// Strategy: split the path into segments. If the first 1–2 segments look like
-/// a locale prefix (short alphabetic tokens, optionally hyphenated), strip them.
-/// We avoid false positives by requiring the segment after the locale to exist
-/// and not look like it could itself be a standalone page slug (i.e. there must
-/// be remaining path after stripping).
-fn strip_locale(path: &str) -> String {
-    let segments: Vec<&str> = path
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    if segments.len() < 2 {
-        return path.to_string();
+fn effective_mode(import: &Import, override_mode: Option<&str>) -> MatchMode {
+    match import.export_profile {
+        ExportProfile::FullUrl | ExportProfile::FullUrlWithQuery => MatchMode::FullUrl,
+        ExportProfile::PathOnly => MatchMode::Path,
+        ExportProfile::HostAndPath | ExportProfile::Unknown => match override_mode {
+            Some("FULL_URL_MODE") => MatchMode::FullUrl,
+            Some("PATH_MODE") => MatchMode::Path,
+            _ => MatchMode::Mixed,
+        },
     }
-
-    /// Returns true if `seg` looks like a locale/region token:
-    /// 2–12 ASCII-lowercase chars with optional hyphens or underscores (not at edges).
-    /// e.g. "se", "en", "en-us", "uk-ie", "africa", "middle-east", "pt_br"
-    fn is_locale_segment(seg: &str) -> bool {
-        let len = seg.len();
-        if !(2..=16).contains(&len) {
-            return false;
-        }
-        seg.bytes().all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_')
-            && !seg.starts_with('-')
-            && !seg.ends_with('-')
-            && !seg.starts_with('_')
-            && !seg.ends_with('_')
-    }
-
-    // First, strip known CMS internal prefixes like "language-masters"
-    let skip = if !segments.is_empty() && matches!(segments[0],
-        "language-masters" | "content" | "cf" | "jcr"
-    ) {
-        1
-    } else {
-        0
-    };
-    let segs = &segments[skip..];
-
-    // Strip two segments (region/country + language): /xx/yy/rest
-    // The second segment (language) must be ≤ 5 chars (e.g. "en", "sv", "en-us",
-    // "pt-br", "pt_br") to avoid false positives on real paths like /careers/open-jobs/…
-    // The first segment (region) uses full is_locale_segment (≤ 16 chars).
-    if segs.len() >= 3
-        && is_locale_segment(segs[0])
-        && segs[1].len() <= 5
-        && is_locale_segment(segs[1])
-    {
-        let rest: String = format!("/{}", segs[2..].join("/"));
-        return rest;
-    }
-    // After a CMS prefix, a single locale segment like "fr-ca" is the full locale
-    // (language-masters uses combined locale codes). Strip it if ≤ 5 chars.
-    if skip > 0 && segs.len() >= 2 && segs[0].len() <= 5 && is_locale_segment(segs[0]) {
-        let rest: String = format!("/{}", segs[1..].join("/"));
-        return rest;
-    }
-    // If we stripped a CMS prefix but no locale, still return without the prefix
-    if skip > 0 && !segs.is_empty() {
-        let rest: String = format!("/{}", segs.join("/"));
-        return rest;
-    }
-    path.to_string()
 }
 
-fn filter_row(row: &Row, requested_metrics: &[String]) -> Row {
+fn materialize_rows(
+    import: &Import,
+    mut ids: Vec<usize>,
+    requested_metrics: &[String],
+    row_match_type: &str,
+) -> Vec<Row> {
+    ids.sort_unstable();
+    ids.dedup();
+    ids.into_iter()
+        .map(|idx| row_to_response(import, idx, requested_metrics, row_match_type))
+        .collect()
+}
+
+fn row_to_response(
+    import: &Import,
+    idx: usize,
+    requested_metrics: &[String],
+    row_match_type: &str,
+) -> Row {
+    let row = &import.rows[idx];
     let metrics = if requested_metrics.is_empty() {
-        row.metrics.clone()
+        import
+            .summary
+            .metric_columns
+            .iter()
+            .enumerate()
+            .filter_map(|(metric_idx, name)| {
+                let value = row.metric_values.get(metric_idx)?;
+                if value.is_empty() {
+                    None
+                } else {
+                    Some((name.clone(), value.clone()))
+                }
+            })
+            .collect::<BTreeMap<_, _>>()
     } else {
-        let mut m = std::collections::BTreeMap::new();
-        for k in requested_metrics {
-            if let Some(v) = row.metrics.get(k) {
-                m.insert(k.clone(), v.clone());
-            }
-        }
-        m
+        requested_metrics
+            .iter()
+            .filter_map(|name| {
+                let metric_idx = import.metric_indexes.get(name)?;
+                let value = row.metric_values.get(*metric_idx)?;
+                if value.is_empty() {
+                    None
+                } else {
+                    Some((name.clone(), value.clone()))
+                }
+            })
+            .collect::<BTreeMap<_, _>>()
     };
+
+    let mut extras = BTreeMap::new();
+    extras.insert("export_profile".to_string(), import.export_profile.as_str().to_string());
+
     Row {
         raw_row_id: row.raw_row_id,
         source_url: row.source_url.clone(),
-        normalized_url: row.normalized_url.clone(),
+        normalized_url: row
+            .normalized_url_key
+            .clone()
+            .unwrap_or_else(|| row.path_key.clone()),
+        match_type: row_match_type.to_string(),
+        match_score: Some(1.0),
         metrics,
-        extras: row.extras.clone(),
-        source_file: None,
-        batch_id: None,
+        extras,
+        source_file: Some(import.summary.file_name.clone()),
+        batch_id: Some(import.summary.batch_id.clone()),
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strip_locale_basic() {
-        assert_eq!(strip_locale("/se/en/careers/open-jobs"), "/careers/open-jobs");
-        assert_eq!(strip_locale("/it/it/products/foo"), "/products/foo");
-        assert_eq!(strip_locale("/ca/en/about"), "/about");
+fn summarize_profiles(imports: &[&Import]) -> String {
+    let mut profiles = imports
+        .iter()
+        .map(|import| import.export_profile.as_str().to_string())
+        .collect::<Vec<_>>();
+    profiles.sort();
+    profiles.dedup();
+    if profiles.len() == 1 {
+        profiles.pop().unwrap_or_else(|| "unknown_export".to_string())
+    } else {
+        "mixed_export_profiles".to_string()
     }
+}
 
-    #[test]
-    fn strip_locale_with_region() {
-        assert_eq!(strip_locale("/us/en-us/careers"), "/careers");
-        assert_eq!(strip_locale("/br/pt-br/page/sub"), "/page/sub");
-    }
+fn dedup(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values.dedup();
+    values
+}
 
-    #[test]
-    fn strip_locale_long_country() {
-        // Hyphenated country codes
-        assert_eq!(
-            strip_locale("/uk-ie/en/company/partners"),
-            "/company/partners"
-        );
-        // Long region names
-        assert_eq!(
-            strip_locale("/africa/en/company/supplying/v"),
-            "/company/supplying/v"
-        );
-        assert_eq!(
-            strip_locale("/middle-east/en/products"),
-            "/products"
-        );
+fn missing_metrics(imports: &[&Import], requested_metrics: &[String]) -> Vec<String> {
+    let mut all_metrics: HashSet<&str> = HashSet::new();
+    for import in imports {
+        for metric in &import.summary.metric_columns {
+            all_metrics.insert(metric.as_str());
+        }
     }
-
-    #[test]
-    fn strip_locale_underscore_lang() {
-        // pt_br style locale
-        assert_eq!(
-            strip_locale("/africa/pt_br/about-us/company-profile"),
-            "/about-us/company-profile"
-        );
-    }
-
-    #[test]
-    fn strip_locale_cms_prefix() {
-        // language-masters prefix
-        assert_eq!(
-            strip_locale("/language-masters/fr-ca/company/profile"),
-            "/company/profile"
-        );
-        // content prefix with locale
-        assert_eq!(
-            strip_locale("/content/us/en/products"),
-            "/products"
-        );
-    }
-
-    #[test]
-    fn strip_locale_no_match() {
-        // Too short / single segment
-        assert_eq!(strip_locale("/se"), "/se");
-        // Already locale-free real paths — must NOT strip
-        assert_eq!(strip_locale("/careers/open-jobs"), "/careers/open-jobs");
-        assert_eq!(
-            strip_locale("/products-and-solutions/transformers"),
-            "/products-and-solutions/transformers"
-        );
-        assert_eq!(strip_locale("/contact-us"), "/contact-us");
-        // Numeric or mixed segments — not locale
-        assert_eq!(strip_locale("/123/en/foo"), "/123/en/foo");
-        // Real deep paths must not be stripped
-        assert_eq!(
-            strip_locale("/careers/open-jobs/details/jid3-184948"),
-            "/careers/open-jobs/details/jid3-184948"
-        );
-    }
-
-    #[test]
-    fn strip_locale_root_after_strip() {
-        let result = strip_locale("/se/en/page");
-        assert_eq!(result, "/page");
-    }
+    requested_metrics
+        .iter()
+        .filter(|metric| !all_metrics.contains(metric.as_str()))
+        .cloned()
+        .collect()
 }

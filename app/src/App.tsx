@@ -1,9 +1,8 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   api,
-  type CanonicalMapping,
   type ImportSummary,
   type LookupHit,
   type UrlListLoad,
@@ -11,7 +10,7 @@ import {
 
 type ResultFilter = "all" | "matched" | "none";
 type LoadedUrlFile = Omit<UrlListLoad, "urls"> & { loaded_count: number };
-type BusyPhase = "import_sources" | "load_url_list" | "lookup" | "mapping";
+type BusyPhase = "import_sources" | "load_url_list" | "lookup";
 
 const CHIP_PREVIEW_LIMIT = 300;
 
@@ -38,21 +37,7 @@ export default function App() {
   const [chipDraft, setChipDraft] = createSignal("");
   const [selectedMetrics, setSelectedMetrics] = createSignal<Set<string>>(new Set());
   const [hits, setHits] = createSignal<LookupHit[]>([]);
-  const [canonicalMappings, setCanonicalMappings] = createSignal<CanonicalMapping[]>([]);
-  const [mappingSourcePattern, setMappingSourcePattern] = createSignal("");
-  const [mappingTargetPath, setMappingTargetPath] = createSignal("");
-  const [mappingHostPattern, setMappingHostPattern] = createSignal("");
-  const [mappingExportProfile, setMappingExportProfile] = createSignal("");
-  const [mappingPriority, setMappingPriority] = createSignal("100");
-  const [mappingNotes, setMappingNotes] = createSignal("");
-  const [editingMappingId, setEditingMappingId] = createSignal<string | null>(null);
-  const [editSourcePattern, setEditSourcePattern] = createSignal("");
-  const [editTargetPath, setEditTargetPath] = createSignal("");
-  const [editHostPattern, setEditHostPattern] = createSignal("");
-  const [editExportProfile, setEditExportProfile] = createSignal("");
-  const [editPriority, setEditPriority] = createSignal("100");
-  const [editNotes, setEditNotes] = createSignal("");
-  const [editActive, setEditActive] = createSignal(true);
+  const [manualMatchMode, setManualMatchMode] = createSignal<"" | "FULL_URL_MODE" | "PATH_MODE">("");
   const [missingMetrics, setMissingMetrics] = createSignal<string[]>([]);
   const [searchedFiles, setSearchedFiles] = createSignal(0);
   const [resultFilter, setResultFilter] = createSignal<ResultFilter>("all");
@@ -71,6 +56,9 @@ export default function App() {
   const matchedCount = createMemo(() => hits().filter((h) => h.matched).length);
   const visibleUrlChips = createMemo(() => urlChips().slice(0, CHIP_PREVIEW_LIMIT));
   const hiddenChipCount = createMemo(() => Math.max(0, urlChips().length - CHIP_PREVIEW_LIMIT));
+  const hasMixedImports = createMemo(() =>
+    imports().some((imp) => imp.match_mode === "MIXED_MODE"),
+  );
   const busyLabel = createMemo(() => {
     switch (busyPhase()) {
       case "import_sources":
@@ -79,8 +67,6 @@ export default function App() {
         return "Loading lookup URL list";
       case "lookup":
         return "Scanning URLs against Adobe data";
-      case "mapping":
-        return "Applying canonical mapping updates";
       default:
         return "Working";
     }
@@ -93,8 +79,6 @@ export default function App() {
         return "Extracting URL values from the selected file.";
       case "lookup":
         return "Evaluating strict match priority rules and collecting candidates.";
-      case "mapping":
-        return "Reindexing loaded imports with the latest mapping rules.";
       default:
         return "Please wait.";
     }
@@ -131,12 +115,7 @@ export default function App() {
   onMount(async () => {
     setImports(await api.listImports());
     setAllMetrics(await api.allMetrics());
-    setCanonicalMappings(await api.listCanonicalMappings());
   });
-
-  async function refreshCanonicalMappings() {
-    setCanonicalMappings(await api.listCanonicalMappings());
-  }
 
   async function refreshImports() {
     setImports(await api.listImports());
@@ -242,193 +221,6 @@ export default function App() {
     setResultFilter("all");
   }
 
-  async function addCanonicalMapping() {
-    const source = mappingSourcePattern().trim();
-    const target = mappingTargetPath().trim();
-    const host = mappingHostPattern().trim();
-    const exportProfile = mappingExportProfile().trim();
-    const notes = mappingNotes().trim();
-    const priority = Number.parseInt(mappingPriority().trim(), 10);
-    if (!source || !target) {
-      setError("Add both source pattern and target canonical path.");
-      return;
-    }
-    beginBusy("mapping");
-    setError(null);
-    setInfo(null);
-    try {
-      await api.addCanonicalMapping(
-        source,
-        target,
-        "path_map",
-        host || undefined,
-        exportProfile || undefined,
-        Number.isFinite(priority) ? priority : 100,
-        notes || undefined,
-      );
-      setMappingSourcePattern("");
-      setMappingTargetPath("");
-      setMappingHostPattern("");
-      setMappingExportProfile("");
-      setMappingPriority("100");
-      setMappingNotes("");
-      await refreshCanonicalMappings();
-      setInfo("Canonical mapping added.");
-      setHits([]);
-      setExpandedDebug(new Set());
-      setMissingMetrics([]);
-      setSearchedFiles(0);
-      setResultFilter("all");
-    } catch (e: any) {
-      setError(String(e));
-    } finally {
-      endBusy();
-    }
-  }
-
-  async function removeCanonicalMapping(mappingId: string) {
-    beginBusy("mapping");
-    setError(null);
-    setInfo(null);
-    try {
-      await api.removeCanonicalMapping(mappingId);
-      await refreshCanonicalMappings();
-      setInfo("Canonical mapping removed.");
-      setHits([]);
-      setExpandedDebug(new Set());
-      setMissingMetrics([]);
-      setSearchedFiles(0);
-      setResultFilter("all");
-    } catch (e: any) {
-      setError(String(e));
-    } finally {
-      endBusy();
-    }
-  }
-
-  function beginEditMapping(mapping: CanonicalMapping) {
-    setEditingMappingId(mapping.mapping_id);
-    setEditSourcePattern(mapping.source_pattern);
-    setEditTargetPath(mapping.target_canonical_path);
-    setEditHostPattern(mapping.host_pattern ?? "");
-    setEditExportProfile(mapping.export_profile ?? "");
-    setEditPriority(String(mapping.priority ?? 100));
-    setEditNotes(mapping.notes ?? "");
-    setEditActive(Boolean(mapping.active));
-  }
-
-  function cancelEditMapping() {
-    setEditingMappingId(null);
-    setEditSourcePattern("");
-    setEditTargetPath("");
-    setEditHostPattern("");
-    setEditExportProfile("");
-    setEditPriority("100");
-    setEditNotes("");
-    setEditActive(true);
-  }
-
-  async function saveEditMapping(mappingId: string) {
-    const source = editSourcePattern().trim();
-    const target = editTargetPath().trim();
-    if (!source || !target) {
-      setError("Source pattern and target canonical path are required.");
-      return;
-    }
-    const parsedPriority = Number.parseInt(editPriority().trim(), 10);
-
-    beginBusy("mapping");
-    setError(null);
-    setInfo(null);
-    try {
-      await api.updateCanonicalMapping(mappingId, {
-        source_pattern: source,
-        target_canonical_path: target,
-        host_pattern: editHostPattern().trim() || "",
-        export_profile: editExportProfile().trim() || "",
-        priority: Number.isFinite(parsedPriority) ? parsedPriority : 100,
-        notes: editNotes().trim() || "",
-        active: editActive(),
-      });
-      await refreshCanonicalMappings();
-      cancelEditMapping();
-      setInfo("Canonical mapping updated.");
-      setHits([]);
-      setExpandedDebug(new Set());
-      setMissingMetrics([]);
-      setSearchedFiles(0);
-      setResultFilter("all");
-    } catch (e: any) {
-      setError(String(e));
-    } finally {
-      endBusy();
-    }
-  }
-
-  async function reorderMapping(mappingId: string, direction: "up" | "down") {
-    beginBusy("mapping");
-    setError(null);
-    setInfo(null);
-    try {
-      await api.reorderCanonicalMapping(mappingId, direction);
-      await refreshCanonicalMappings();
-      setInfo("Canonical mapping order updated.");
-      setHits([]);
-      setExpandedDebug(new Set());
-      setMissingMetrics([]);
-      setSearchedFiles(0);
-      setResultFilter("all");
-    } catch (e: any) {
-      setError(String(e));
-    } finally {
-      endBusy();
-    }
-  }
-
-  async function importCanonicalMappingsFromJson() {
-    beginBusy("mapping");
-    setError(null);
-    setInfo(null);
-    try {
-      const picked = await open({
-        multiple: false,
-        filters: [{ name: "JSON", extensions: ["json"] }],
-      });
-      if (!picked || Array.isArray(picked)) return;
-      const added = await api.importCanonicalMappings(picked);
-      await refreshCanonicalMappings();
-      setInfo(`Imported ${added} canonical mapping${added === 1 ? "" : "s"}.`);
-      setHits([]);
-      setExpandedDebug(new Set());
-      setMissingMetrics([]);
-      setSearchedFiles(0);
-      setResultFilter("all");
-    } catch (e: any) {
-      setError(String(e));
-    } finally {
-      endBusy();
-    }
-  }
-
-  async function exportCanonicalMappingsToJson() {
-    beginBusy("mapping");
-    setError(null);
-    setInfo(null);
-    try {
-      const destination = await save({
-        defaultPath: "canonical-mappings.json",
-        filters: [{ name: "JSON", extensions: ["json"] }],
-      });
-      if (!destination) return;
-      await api.exportCanonicalMappings(destination);
-      setInfo("Canonical mappings exported.");
-    } catch (e: any) {
-      setError(String(e));
-    } finally {
-      endBusy();
-    }
-  }
-
   function looksLikeUrl(s: string): boolean {
     if (!s) return false;
     if (s.startsWith("/")) return true;
@@ -440,8 +232,16 @@ export default function App() {
   function splitUrls(text: string): string[] {
     // Split on any line ending or tab (Excel multi-column paste).
     // Do NOT split on `;` — it's a valid URL character (matrix params, jsessionid).
-    return text
+    const primary = text
       .split(/[\r\n\t]+/)
+      .map((s) => s.trim().replace(/^["']|["']$/g, ""))
+      .filter((s) => looksLikeUrl(s));
+    if (primary.length > 0) return primary;
+
+    // Fallback for CSV-style one-line paste: "url1,url2,url3"
+    // Only used when primary parsing found nothing.
+    return text
+      .split(",")
       .map((s) => s.trim().replace(/^["']|["']$/g, ""))
       .filter((s) => looksLikeUrl(s));
   }
@@ -520,12 +320,17 @@ export default function App() {
       setError("Add at least one URL.");
       return;
     }
+    if (hasMixedImports() && !manualMatchMode()) {
+      setError("Mixed export format detected. Choose FULL_URL_MODE or PATH_MODE before lookup.");
+      return;
+    }
     beginBusy("lookup");
     try {
       const resp = await api.lookupUrls(
         urls,
         [...selectedMetrics()],
         imports().map((imp) => imp.batch_id),
+        manualMatchMode() || undefined,
       );
       setHits(resp.hits);
       setExpandedDebug(new Set());
@@ -566,33 +371,45 @@ export default function App() {
   function exportCsv() {
     const sel = [...selectedMetrics()];
     const header = [
-      "query",
-      "exact_adobe_match",
+      "input_url",
+      "match_mode",
+      "exact_match_found",
       "match_count",
-      "match_type",
-      "match_score",
+      "status",
       "source_file",
-      "source_url",
+      "matched_adobe_value",
       ...sel,
+      "notes",
     ];
     const lines = [header.join(",")];
     for (const h of filteredHits()) {
       if (h.rows.length === 0) {
         lines.push(
-          [csv(h.query), "false", "0", csv(h.match_type), "", "", "", ...sel.map(() => "")].join(","),
+          [
+            csv(h.query),
+            csv(h.match_mode),
+            "false",
+            "0",
+            csv(h.status),
+            "",
+            "",
+            ...sel.map(() => ""),
+            csv(h.notes ?? ""),
+          ].join(","),
         );
       } else {
         for (const r of h.rows) {
           lines.push(
             [
               csv(h.query),
+              csv(h.match_mode),
               String(h.matched),
               String(h.match_count),
-              csv(r.match_type || h.match_type),
-              csv(r.match_score != null ? r.match_score.toFixed(3) : ""),
+              csv(h.status),
               csv(r.source_file ?? ""),
               csv(r.source_url),
               ...sel.map((m) => csv(r.metrics[m] ?? "")),
+              csv(h.notes ?? ""),
             ].join(","),
           );
         }
@@ -620,50 +437,37 @@ export default function App() {
   }
 
   function describeImportShape(imp: ImportSummary) {
-    const parts = [imp.export_profile.replace(/_/g, " ")];
+    const parts = [imp.match_mode, imp.export_profile.replace(/_/g, " ")];
     if (imp.truncation_cap != null) {
       parts.push(`cap ${imp.truncation_cap}`);
     }
     return parts.join(" · ");
   }
 
-  function describeMatchType(matchType: string, score?: number) {
+  function describeMatchType(matchType: string) {
     switch (matchType) {
-      case "RAW_EXACT":
-        return "Raw exact URL match";
-      case "NORMALIZED_EXACT":
-        return "Normalized URL exact match";
-      case "PAGE_IDENTITY_MATCH":
-        return "Page-identity match";
-      case "HOST_AND_PATH_MATCH":
-        return "Host + path match";
-      case "PATH_ONLY_MATCH":
-        return "Path exact match";
-      case "CANONICAL_PATH_MATCH":
-        return "Canonical path match";
-      case "AMBIGUOUS_MATCH":
-        return "Ambiguous match";
-      case "SUGGESTION_ONLY":
-        return "Suggestion only";
+      case "EXACT_MATCH":
+        return "Exact match";
+      case "EXACT_DUPLICATE":
+        return "Duplicate exact matches found";
       case "NO_MATCH":
-        return "No match";
+        return "No exact match found";
       default:
-        return "no match";
+        return matchType;
     }
   }
 
-  function badgeClass(matchType: string) {
-    if (matchType === "NO_MATCH" || matchType === "AMBIGUOUS_MATCH") {
-      return "neutral";
+  function badgeClass(status: string) {
+    if (status === "Matched") {
+      return "ok";
     }
-    if (matchType === "SUGGESTION_ONLY") {
+    if (status === "Duplicate exact matches found" || status === "Mixed export format") {
       return "warn";
     }
-    return "ok";
-  }
-
-  function bestMatchScore(hit: LookupHit) {
-    return hit.rows.reduce((max, row) => Math.max(max, row.match_score ?? 0), 0);
+    if (status === "No exact match found" || status === "Invalid URL") {
+      return "neutral";
+    }
+    return "neutral";
   }
 
   function hitDebugKey(hit: LookupHit, idx: number) {
@@ -684,13 +488,13 @@ export default function App() {
 
   const resultFilterOptions: Array<{ value: ResultFilter; label: string }> = [
     { value: "all", label: "All" },
-    { value: "matched", label: "Confirmed matches" },
-    { value: "none", label: "No Adobe evidence" },
+    { value: "matched", label: "Matched" },
+    { value: "none", label: "No exact match" },
   ];
 
   const showMultiFile = createMemo(() => imports().length > 1);
   const debugColSpan = createMemo(
-    () => 3 + (showMultiFile() ? 1 : 0) + selectedMetrics().size,
+    () => 5 + (showMultiFile() ? 1 : 0) + selectedMetrics().size,
   );
 
   return (
@@ -763,199 +567,31 @@ export default function App() {
           </div>
 
           <div>
-            <div class="section-title">Canonical Mappings ({canonicalMappings().length})</div>
-            <input
-              type="text"
-              placeholder="Source pattern (e.g. /se/en/products/*)"
-              value={mappingSourcePattern()}
-              onInput={(e) => setMappingSourcePattern(e.currentTarget.value)}
-              disabled={busy()}
-            />
-            <input
-              type="text"
-              placeholder="Target canonical path (e.g. /products)"
-              value={mappingTargetPath()}
-              onInput={(e) => setMappingTargetPath(e.currentTarget.value)}
-              disabled={busy()}
-              style={{ "margin-top": "8px" }}
-            />
-            <input
-              type="text"
-              placeholder="Host pattern (optional, e.g. *.hitachienergy.com)"
-              value={mappingHostPattern()}
-              onInput={(e) => setMappingHostPattern(e.currentTarget.value)}
-              disabled={busy()}
-              style={{ "margin-top": "8px" }}
-            />
-            <input
-              type="text"
-              placeholder="Export profile (optional)"
-              value={mappingExportProfile()}
-              onInput={(e) => setMappingExportProfile(e.currentTarget.value)}
-              disabled={busy()}
-              style={{ "margin-top": "8px" }}
-            />
-            <input
-              type="text"
-              placeholder="Priority (default 100)"
-              value={mappingPriority()}
-              onInput={(e) => setMappingPriority(e.currentTarget.value)}
-              disabled={busy()}
-              style={{ "margin-top": "8px" }}
-            />
-            <input
-              type="text"
-              placeholder="Notes (optional)"
-              value={mappingNotes()}
-              onInput={(e) => setMappingNotes(e.currentTarget.value)}
-              disabled={busy()}
-              style={{ "margin-top": "8px" }}
-            />
-            <div class="row" style={{ "margin-top": "8px" }}>
-              <button class="ghost" onClick={addCanonicalMapping} disabled={busy()}>
-                Add mapping
-              </button>
-              <button class="ghost" onClick={importCanonicalMappingsFromJson} disabled={busy()}>
-                Import JSON
-              </button>
-              <button class="ghost" onClick={exportCanonicalMappingsToJson} disabled={busy()}>
-                Export JSON
-              </button>
+            <div class="section-title">Matching Mode</div>
+            <div class="subtle-note">
+              V1 uses strict exact matching only. Canonical mappings and fuzzy matching are disabled.
             </div>
-            <Show when={canonicalMappings().length > 0}>
-              <div class="file-note-list">
-                <For each={canonicalMappings()}>
-                  {(mapping) => (
-                    <div class="file-note">
-                      <Show
-                        when={editingMappingId() === mapping.mapping_id}
-                        fallback={
-                          <>
-                            <div>{mapping.source_pattern} → {mapping.target_canonical_path}</div>
-                            <Show when={mapping.host_pattern || mapping.export_profile}>
-                              <div class="subtle-note">
-                                {mapping.host_pattern ? `host=${mapping.host_pattern}` : ""}
-                                {mapping.host_pattern && mapping.export_profile ? " · " : ""}
-                                {mapping.export_profile ? `profile=${mapping.export_profile}` : ""}
-                              </div>
-                            </Show>
-                            <Show when={mapping.notes}>
-                              <div class="subtle-note">notes: {mapping.notes}</div>
-                            </Show>
-                            <div class="row mapping-actions" style={{ "margin-top": "6px" }}>
-                              <span class="subtle-note">
-                                {mapping.rule_type} · priority {mapping.priority}
-                              </span>
-                              <span class="spacer" />
-                              <button
-                                class="ghost compact"
-                                title="Move up"
-                                onClick={() => reorderMapping(mapping.mapping_id, "up")}
-                                disabled={busy()}
-                              >
-                                ↑
-                              </button>
-                              <button
-                                class="ghost compact"
-                                title="Move down"
-                                onClick={() => reorderMapping(mapping.mapping_id, "down")}
-                                disabled={busy()}
-                              >
-                                ↓
-                              </button>
-                              <button
-                                class="ghost compact"
-                                title="Edit mapping"
-                                onClick={() => beginEditMapping(mapping)}
-                                disabled={busy()}
-                              >
-                                Edit
-                              </button>
-                              <button
-                                class="x-btn"
-                                title="Remove mapping"
-                                onClick={() => removeCanonicalMapping(mapping.mapping_id)}
-                                disabled={busy()}
-                              >
-                                ×
-                              </button>
-                            </div>
-                          </>
-                        }
-                      >
-                        <div class="mapping-edit-grid">
-                          <input
-                            type="text"
-                            value={editSourcePattern()}
-                            onInput={(e) => setEditSourcePattern(e.currentTarget.value)}
-                            placeholder="Source pattern"
-                            disabled={busy()}
-                          />
-                          <input
-                            type="text"
-                            value={editTargetPath()}
-                            onInput={(e) => setEditTargetPath(e.currentTarget.value)}
-                            placeholder="Target path"
-                            disabled={busy()}
-                          />
-                          <input
-                            type="text"
-                            value={editHostPattern()}
-                            onInput={(e) => setEditHostPattern(e.currentTarget.value)}
-                            placeholder="Host pattern (optional)"
-                            disabled={busy()}
-                          />
-                          <input
-                            type="text"
-                            value={editExportProfile()}
-                            onInput={(e) => setEditExportProfile(e.currentTarget.value)}
-                            placeholder="Export profile (optional)"
-                            disabled={busy()}
-                          />
-                          <input
-                            type="text"
-                            value={editPriority()}
-                            onInput={(e) => setEditPriority(e.currentTarget.value)}
-                            placeholder="Priority"
-                            disabled={busy()}
-                          />
-                          <input
-                            type="text"
-                            value={editNotes()}
-                            onInput={(e) => setEditNotes(e.currentTarget.value)}
-                            placeholder="Notes (optional)"
-                            disabled={busy()}
-                          />
-                          <label class="mapping-active">
-                            <input
-                              type="checkbox"
-                              checked={editActive()}
-                              onChange={(e) => setEditActive(e.currentTarget.checked)}
-                              disabled={busy()}
-                            />
-                            active
-                          </label>
-                        </div>
-                        <div class="row mapping-actions" style={{ "margin-top": "6px" }}>
-                          <button
-                            class="ghost compact"
-                            onClick={() => saveEditMapping(mapping.mapping_id)}
-                            disabled={busy()}
-                          >
-                            Save
-                          </button>
-                          <button
-                            class="ghost compact"
-                            onClick={cancelEditMapping}
-                            disabled={busy()}
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      </Show>
-                    </div>
-                  )}
-                </For>
+            <Show when={hasMixedImports()}>
+              <div style={{ "margin-top": "8px" }}>
+                <div class="warn">
+                  Mixed export format detected. Choose one mode manually before lookup.
+                </div>
+                <div class="row" style={{ "margin-top": "8px" }}>
+                  <button
+                    class={`ghost compact ${manualMatchMode() === "FULL_URL_MODE" ? "active" : ""}`}
+                    onClick={() => setManualMatchMode("FULL_URL_MODE")}
+                    disabled={busy()}
+                  >
+                    FULL_URL_MODE
+                  </button>
+                  <button
+                    class={`ghost compact ${manualMatchMode() === "PATH_MODE" ? "active" : ""}`}
+                    onClick={() => setManualMatchMode("PATH_MODE")}
+                    disabled={busy()}
+                  >
+                    PATH_MODE
+                  </button>
+                </div>
               </div>
             </Show>
           </div>
@@ -1138,13 +774,15 @@ export default function App() {
                   <table>
                     <thead>
                       <tr>
-                        <th>Query</th>
-                        <th>Match Status</th>
+                        <th>Input URL</th>
+                        <th>Match mode</th>
+                        <th>Status</th>
                         <Show when={showMultiFile()}>
                           <th>Source</th>
                         </Show>
-                        <th>Adobe Export URL</th>
+                        <th>Matched Adobe value</th>
                         <For each={[...selectedMetrics()]}>{(m) => <th>{m}</th>}</For>
+                        <th>Notes</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1157,22 +795,10 @@ export default function App() {
                                 <tr class="miss">
                                   <td class="url-cell">
                                     {h.query}
-                                    <div class="normalized-hint">
-                                      looked up as: {h.normalized_query}
-                                    </div>
-                                    <Show when={h.warnings.length > 0}>
-                                      <div class="normalized-hint">
-                                        {h.warnings.join(" · ")}
-                                      </div>
-                                    </Show>
-                                    <Show when={h.discarded_variants.length > 0}>
-                                      <div class="normalized-hint">
-                                        discarded: {h.discarded_variants.slice(0, 3).join(" | ")}
-                                      </div>
-                                    </Show>
                                   </td>
+                                  <td>{h.match_mode}</td>
                                   <td>
-                                    <span class="badge neutral">no Adobe evidence</span>
+                                    <span class={`badge ${badgeClass(h.status)}`}>{h.status}</span>
                                     <button
                                       class="debug-btn"
                                       onClick={() => toggleDebug(h, hitIndex())}
@@ -1185,6 +811,7 @@ export default function App() {
                                   </Show>
                                   <td>—</td>
                                   <For each={[...selectedMetrics()]}>{() => <td>—</td>}</For>
+                                  <td>{h.notes || "—"}</td>
                                 </tr>
                               }
                             >
@@ -1192,30 +819,15 @@ export default function App() {
                                 {(r) => (
                                   <tr class={h.ambiguous ? "amb" : ""}>
                                     <td class="url-cell">{h.query}</td>
+                                    <td>{h.match_mode}</td>
                                     <td>
-                                      <span class={`badge ${badgeClass(r.match_type || h.match_type)}`}>
-                                        {describeMatchType(
-                                          r.match_type || h.match_type,
-                                          r.match_score ?? bestMatchScore(h),
-                                        )}
-                                        {` (${(r.match_score ?? bestMatchScore(h)).toFixed(2)})`}
-                                      </span>
+                                      <span class={`badge ${badgeClass(h.status)}`}>{h.status}</span>
                                       <button
                                         class="debug-btn"
                                         onClick={() => toggleDebug(h, hitIndex())}
                                       >
                                         {isDebugExpanded(h, hitIndex()) ? "Hide debug" : "Show debug"}
                                       </button>
-                                      <Show when={h.warnings.length > 0}>
-                                        <div class="normalized-hint">
-                                          {h.warnings.join(" · ")}
-                                        </div>
-                                      </Show>
-                                      <Show when={h.discarded_variants.length > 0}>
-                                        <div class="normalized-hint">
-                                          discarded: {h.discarded_variants.slice(0, 3).join(" | ")}
-                                        </div>
-                                      </Show>
                                     </td>
                                     <Show when={showMultiFile()}>
                                       <td class="src-cell">{r.source_file ?? ""}</td>
@@ -1224,6 +836,7 @@ export default function App() {
                                     <For each={[...selectedMetrics()]}>
                                       {(m) => <td>{r.metrics[m] ?? "—"}</td>}
                                     </For>
+                                    <td>{h.notes || "—"}</td>
                                   </tr>
                                 )}
                               </For>
