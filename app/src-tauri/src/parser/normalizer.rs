@@ -122,8 +122,9 @@ pub fn build_match_forms(input: &str) -> MatchForms {
         let has_fragment = fragment.is_some();
         let normalized_query = normalize_query(parsed.query());
         let buckets = classify_query_params(normalized_query.as_deref());
-        let normalized_url_key = build_full_key(&authority, &path, normalized_query.as_deref());
+        let normalized_url_key = build_full_key(&scheme, &authority, &path, normalized_query.as_deref());
         let page_identity_key = build_full_key(
+            &scheme,
             &authority,
             &path,
             drop_tracking_params(normalized_query.as_deref()).as_deref(),
@@ -209,26 +210,14 @@ fn canonicalize_path(path: &str) -> String {
     let mut p = if path.is_empty() {
         "/".to_string()
     } else {
-        path.to_ascii_lowercase()
+        path.trim().to_string()
     };
+    if !p.starts_with('/') {
+        p = format!("/{}", p);
+    }
 
     while p.contains("//") {
         p = p.replace("//", "/");
-    }
-
-    for suffix in [
-        "/index.html",
-        "/index.htm",
-        "/index.php",
-        "/index.aspx",
-        "/default.aspx",
-        "/default.html",
-        "/default.htm",
-    ] {
-        if p.ends_with(suffix) {
-            p.truncate(p.len() - suffix.len());
-            break;
-        }
     }
 
     if p.len() > 1 {
@@ -328,10 +317,10 @@ fn classify_query_params(query: Option<&str>) -> ParamBuckets {
     buckets
 }
 
-fn build_full_key(authority: &str, path: &str, query: Option<&str>) -> String {
+fn build_full_key(scheme: &str, authority: &str, path: &str, query: Option<&str>) -> String {
     match query {
-        Some(query) if !query.is_empty() => format!("https://{}{}?{}", authority, path, query),
-        _ => format!("https://{}{}", authority, path),
+        Some(query) if !query.is_empty() => format!("{}://{}{}?{}", scheme, authority, path, query),
+        _ => format!("{}://{}{}", scheme, authority, path),
     }
 }
 
@@ -379,10 +368,10 @@ mod tests {
     }
 
     #[test]
-    fn case_insensitive() {
+    fn path_case_preserved() {
         assert_eq!(
             normalize_url("/Careers/Open-Jobs"),
-            normalize_url("/careers/open-jobs")
+            "/Careers/Open-Jobs"
         );
     }
 

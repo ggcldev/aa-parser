@@ -116,9 +116,7 @@ where
     let mut full_like_rows = 0usize;
     let mut path_like_rows = 0usize;
     let mut query_rows = 0usize;
-    let mut http_prefixed_rows = 0usize;
-    let mut slash_prefixed_rows = 0usize;
-    let mut other_prefixed_rows = 0usize;
+    let mut mode_sample_values: Vec<String> = Vec::new();
 
     if let Some(row) = first_data_row {
         if !mapping.skip_first_data_row {
@@ -137,9 +135,7 @@ where
                 &mut full_like_rows,
                 &mut path_like_rows,
                 &mut query_rows,
-                &mut http_prefixed_rows,
-                &mut slash_prefixed_rows,
-                &mut other_prefixed_rows,
+                &mut mode_sample_values,
             );
         }
     }
@@ -160,9 +156,7 @@ where
             &mut full_like_rows,
             &mut path_like_rows,
             &mut query_rows,
-            &mut http_prefixed_rows,
-            &mut slash_prefixed_rows,
-            &mut other_prefixed_rows,
+            &mut mode_sample_values,
         );
     }
 
@@ -179,13 +173,7 @@ where
     } else {
         UrlValueKind::PathOnly
     };
-    let export_profile = classify_export_profile(
-        http_prefixed_rows,
-        slash_prefixed_rows,
-        other_prefixed_rows,
-        query_rows,
-        rows.len(),
-    );
+    let export_profile = classify_export_profile(&mode_sample_values, query_rows);
     let match_mode = classify_match_mode(export_profile);
     if match_mode == "MIXED_MODE" {
         warnings.push(
@@ -258,9 +246,7 @@ fn process_row(
     full_like_rows: &mut usize,
     path_like_rows: &mut usize,
     query_rows: &mut usize,
-    http_prefixed_rows: &mut usize,
-    slash_prefixed_rows: &mut usize,
-    other_prefixed_rows: &mut usize,
+    mode_sample_values: &mut Vec<String>,
 ) {
     if raw.iter().all(|cell| cell.trim().is_empty()) {
         return;
@@ -270,13 +256,8 @@ fn process_row(
     if source_url.trim().is_empty() {
         return;
     }
-    let source_trimmed = source_url.trim().to_ascii_lowercase();
-    if source_trimmed.starts_with("http://") || source_trimmed.starts_with("https://") {
-        *http_prefixed_rows += 1;
-    } else if source_trimmed.starts_with('/') {
-        *slash_prefixed_rows += 1;
-    } else {
-        *other_prefixed_rows += 1;
+    if mode_sample_values.len() < 20 {
+        mode_sample_values.push(source_url.trim().to_string());
     }
 
     let forms = build_match_forms(&source_url);
@@ -350,29 +331,32 @@ fn process_row(
 }
 
 fn classify_export_profile(
-    http_prefixed_rows: usize,
-    slash_prefixed_rows: usize,
-    other_prefixed_rows: usize,
+    sample_values: &[String],
     query_rows: usize,
-    total_rows: usize,
 ) -> ExportProfile {
-    if total_rows == 0 {
+    if sample_values.is_empty() {
         return ExportProfile::Unknown;
     }
 
-    let http_majority = http_prefixed_rows.saturating_mul(100) / total_rows >= 80;
-    let path_majority = slash_prefixed_rows.saturating_mul(100) / total_rows >= 80;
-    let only_http = http_prefixed_rows > 0 && slash_prefixed_rows == 0 && other_prefixed_rows == 0;
-    let only_path = slash_prefixed_rows > 0 && http_prefixed_rows == 0 && other_prefixed_rows == 0;
+    let mut full = 0usize;
+    let mut path = 0usize;
+    for value in sample_values {
+        let trimmed = value.trim().to_ascii_lowercase();
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            full += 1;
+        } else if trimmed.starts_with('/') {
+            path += 1;
+        }
+    }
 
-    if only_http || http_majority {
-        if query_rows.saturating_mul(100) / http_prefixed_rows.max(1) >= 25 {
+    if full > 0 && path == 0 {
+        if query_rows.saturating_mul(100) / full.max(1) >= 25 {
             return ExportProfile::FullUrlWithQuery;
         }
         return ExportProfile::FullUrl;
     }
 
-    if only_path || path_majority {
+    if path > 0 && full == 0 {
         return ExportProfile::PathOnly;
     }
 

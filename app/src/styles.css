@@ -606,25 +606,6 @@ tbody tr.amb td:first-child::after {
   font-size: 11px;
   line-height: 1.45;
 }
-.mapping-edit-grid {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 6px;
-}
-.mapping-actions {
-  gap: 6px;
-}
-.mapping-active {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--text-dim);
-  font-size: 11px;
-}
-.mapping-active input {
-  width: 13px;
-  height: 13px;
-}
 .file-note-warn {
   color: var(--warn);
   margin-top: 4px;
