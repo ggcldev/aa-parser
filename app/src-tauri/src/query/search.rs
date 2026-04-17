@@ -20,14 +20,52 @@ impl MatchMode {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum QueryMode {
+    Url,
+    Keyword,
+}
+
 pub fn lookup_multi(
     imports: &[&Import],
     queries: &[String],
     requested_metrics: &[String],
     match_mode_override: Option<String>,
 ) -> LookupResponse {
+    lookup_multi_with_mode(
+        imports,
+        queries,
+        requested_metrics,
+        match_mode_override,
+        QueryMode::Url,
+    )
+}
+
+pub fn lookup_multi_with_mode(
+    imports: &[&Import],
+    queries: &[String],
+    requested_metrics: &[String],
+    match_mode_override: Option<String>,
+    query_mode: QueryMode,
+) -> LookupResponse {
     let mut hits = Vec::with_capacity(queries.len());
     let requested_missing = missing_metrics(imports, requested_metrics);
+    let keyword_haystacks = if query_mode == QueryMode::Keyword {
+        Some(
+            imports
+                .iter()
+                .map(|import| {
+                    import
+                        .rows
+                        .iter()
+                        .map(|row| build_keyword_haystack(&row.source_url))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
 
     for query in queries {
         let trimmed = query.trim();
@@ -36,14 +74,44 @@ pub fn lookup_multi(
         }
 
         let forms = build_match_forms(trimmed);
+        let keyword_query = if query_mode == QueryMode::Keyword {
+            Some(build_keyword_query(trimmed))
+        } else {
+            None
+        };
         let mut all_rows = Vec::new();
         let mut effective_modes = Vec::new();
         let mut invalid_url_for_full_mode = false;
         let mut mixed_mode_blocked = false;
 
-        for import in imports {
+        for (import_idx, import) in imports.iter().enumerate() {
             let mode = effective_mode(import, match_mode_override.as_deref());
             effective_modes.push(mode.as_str().to_string());
+
+            if query_mode == QueryMode::Keyword {
+                if let Some(keyword_query) = keyword_query.as_ref() {
+                    if keyword_query.tokens.is_empty() {
+                        continue;
+                    }
+                    let ids = collect_keyword_ids(
+                        keyword_haystacks
+                            .as_ref()
+                            .and_then(|all| all.get(import_idx))
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
+                        keyword_query,
+                    );
+                    if !ids.is_empty() {
+                        all_rows.extend(materialize_rows(
+                            import,
+                            ids,
+                            requested_metrics,
+                            "KEYWORD_EXACT_MATCH",
+                        ));
+                    }
+                }
+                continue;
+            }
 
             match mode {
                 MatchMode::Mixed => {
@@ -94,60 +162,107 @@ pub fn lookup_multi(
             ));
         }
 
-        let unique_modes = dedup(effective_modes);
-        let mode_label = if unique_modes.len() == 1 {
-            unique_modes[0].clone()
-        } else {
-            "MIXED_MODE".to_string()
-        };
+        let (mode_label, status, matched, ambiguous, match_type, confidence) =
+            if query_mode == QueryMode::Keyword {
+                let (status, matched, ambiguous, match_type, confidence) = if all_rows.is_empty() {
+                    (
+                        "No keyword match found".to_string(),
+                        false,
+                        false,
+                        "NO_MATCH".to_string(),
+                        0.0,
+                    )
+                } else {
+                    (
+                        "Matched".to_string(),
+                        true,
+                        false,
+                        "KEYWORD_MATCH".to_string(),
+                        if all_rows.len() == 1 { 1.0 } else { 0.8 },
+                    )
+                };
+                (
+                    "KEYWORD_MODE".to_string(),
+                    status,
+                    matched,
+                    ambiguous,
+                    match_type,
+                    confidence,
+                )
+            } else {
+                let unique_modes = dedup(effective_modes);
+                let mode_label = if unique_modes.len() == 1 {
+                    unique_modes[0].clone()
+                } else {
+                    "MIXED_MODE".to_string()
+                };
 
-        let (status, matched, ambiguous, match_type, confidence) = if mixed_mode_blocked
-            && match_mode_override.is_none()
-        {
-            (
-                "Mixed export format".to_string(),
-                false,
-                false,
-                "NO_MATCH".to_string(),
-                0.0,
-            )
-        } else if invalid_url_for_full_mode && all_rows.is_empty() {
-            (
-                "Invalid URL".to_string(),
-                false,
-                false,
-                "NO_MATCH".to_string(),
-                0.0,
-            )
-        } else if all_rows.is_empty() {
-            (
-                "No exact match found".to_string(),
-                false,
-                false,
-                "NO_MATCH".to_string(),
-                0.0,
-            )
-        } else if all_rows.len() > 1 {
-            (
-                "Duplicate exact matches found".to_string(),
-                false,
-                true,
-                "EXACT_DUPLICATE".to_string(),
-                1.0,
-            )
-        } else {
-            ("Matched".to_string(), true, false, "EXACT_MATCH".to_string(), 1.0)
-        };
+                let (status, matched, ambiguous, match_type, confidence) = if mixed_mode_blocked
+                    && match_mode_override.is_none()
+                {
+                    (
+                        "Mixed export format".to_string(),
+                        false,
+                        false,
+                        "NO_MATCH".to_string(),
+                        0.0,
+                    )
+                } else if invalid_url_for_full_mode && all_rows.is_empty() {
+                    (
+                        "Invalid URL".to_string(),
+                        false,
+                        false,
+                        "NO_MATCH".to_string(),
+                        0.0,
+                    )
+                } else if all_rows.is_empty() {
+                    (
+                        "No exact match found".to_string(),
+                        false,
+                        false,
+                        "NO_MATCH".to_string(),
+                        0.0,
+                    )
+                } else if all_rows.len() > 1 {
+                    (
+                        "Duplicate exact matches found".to_string(),
+                        false,
+                        true,
+                        "EXACT_DUPLICATE".to_string(),
+                        1.0,
+                    )
+                } else {
+                    ("Matched".to_string(), true, false, "EXACT_MATCH".to_string(), 1.0)
+                };
+                (
+                    mode_label,
+                    status,
+                    matched,
+                    ambiguous,
+                    match_type,
+                    confidence,
+                )
+            };
 
         if status == "Mixed export format" {
             notes.push(
                 "Choose FULL_URL_MODE or PATH_MODE manually for mixed Adobe exports.".to_string(),
             );
         }
+        if query_mode == QueryMode::Keyword && !all_rows.is_empty() {
+            notes.push(format!("{} keyword{} matched.", all_rows.len(), if all_rows.len() == 1 { "" } else { "s" }));
+        }
 
         hits.push(LookupHit {
             query: query.clone(),
-            normalized_query: forms.path_key.clone(),
+            normalized_query: if query_mode == QueryMode::Keyword {
+                keyword_query
+                    .as_ref()
+                    .map(|k| k.tokens.join(" "))
+                    .unwrap_or_default()
+            } else {
+                forms.path_key.clone()
+            },
             match_mode: mode_label,
             status,
             notes: notes.join(" · "),
@@ -181,10 +296,61 @@ pub fn lookup_multi(
     }
 }
 
+#[derive(Clone)]
+struct KeywordHaystack {
+    normal: String,
+    compact: String,
+}
+
+#[derive(Clone)]
+struct KeywordQuery {
+    tokens: Vec<String>,
+    compact: String,
+}
+
+fn build_keyword_haystack(input: &str) -> KeywordHaystack {
+    let normal = normalize_keyword_text(input);
+    let compact = normal.chars().filter(|c| !c.is_whitespace()).collect();
+    KeywordHaystack { normal, compact }
+}
+
+fn build_keyword_query(input: &str) -> KeywordQuery {
+    let normal = normalize_keyword_text(input);
+    let tokens = normal
+        .split_whitespace()
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_string())
+        .collect::<Vec<_>>();
+    let compact = tokens.join("");
+    KeywordQuery { tokens, compact }
+}
+
+fn normalize_keyword_text(input: &str) -> String {
+    input
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn collect_keyword_ids(haystacks: &[KeywordHaystack], query: &KeywordQuery) -> Vec<usize> {
+    let query_normal = query.tokens.join(" ");
+    haystacks
+        .iter()
+        .enumerate()
+        .filter(|(_, haystack)| haystack.normal == query_normal)
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 fn effective_mode(import: &Import, override_mode: Option<&str>) -> MatchMode {
     match import.export_profile {
         ExportProfile::FullUrl | ExportProfile::FullUrlWithQuery => MatchMode::FullUrl,
         ExportProfile::PathOnly => MatchMode::Path,
+        // Keyword imports are only used in keyword query mode; return Path
+        // as a harmless default if URL mode is attempted against them.
+        ExportProfile::KeywordExport => MatchMode::Path,
         ExportProfile::HostAndPath | ExportProfile::Unknown => match override_mode {
             Some("FULL_URL_MODE") => MatchMode::FullUrl,
             Some("PATH_MODE") => MatchMode::Path,

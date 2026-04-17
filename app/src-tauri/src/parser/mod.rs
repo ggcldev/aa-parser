@@ -14,6 +14,20 @@ use std::collections::HashMap;
 use std::path::Path;
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LookupValueMode {
+    Url,
+    Keyword,
+}
+
+pub struct LookupValues {
+    pub file_name: String,
+    pub row_count: usize,
+    pub column_name: String,
+    pub warnings: Vec<String>,
+    pub values: Vec<String>,
+}
+
 pub fn import_path(path: &str) -> Result<Import> {
     let p = Path::new(path);
     let ext = p
@@ -27,6 +41,119 @@ pub fn import_path(path: &str) -> Result<Import> {
         "xlsx" | "xls" | "xlsm" => import_xlsx(p),
         other => Err(anyhow!("unsupported file type: .{}", other)),
     }
+}
+
+pub fn load_lookup_values(path: &str, mode: LookupValueMode) -> Result<LookupValues> {
+    let p = Path::new(path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match ext.as_str() {
+        "csv" | "tsv" | "txt" => {
+            let mut reader = csv_parser::reader(p)?;
+            let rows = reader
+                .records()
+                .map(|record| record.map(record_to_row).map_err(anyhow::Error::from));
+            load_lookup_rows(p, rows, mode)
+        }
+        "xlsx" | "xls" | "xlsm" => {
+            let range = xlsx_parser::first_sheet_range(p)?;
+            let rows = range
+                .rows()
+                .map(|row| Ok(row.iter().map(xlsx_parser::cell_to_string).collect::<Vec<_>>()));
+            load_lookup_rows(p, rows, mode)
+        }
+        other => Err(anyhow!("unsupported file type: .{}", other)),
+    }
+}
+
+fn load_lookup_rows<I>(path: &Path, rows: I, mode: LookupValueMode) -> Result<LookupValues>
+where
+    I: IntoIterator<Item = Result<Vec<String>>>,
+{
+    let mut iter = rows.into_iter();
+
+    let mut headers: Option<Vec<String>> = None;
+    while let Some(row) = iter.next() {
+        let row = row?;
+        if is_skippable(&row) {
+            continue;
+        }
+        if has_multiple_cells(&row) || looks_like_header(&row) {
+            headers = Some(row.iter().map(|s| trim_cell(s)).collect());
+            break;
+        }
+    }
+    let mut headers = headers.ok_or_else(|| anyhow!("file is empty"))?;
+
+    let mut first_data_row: Option<Vec<String>> = None;
+    while let Some(row) = iter.next() {
+        let row = row?;
+        if row.iter().all(|c| c.trim().is_empty()) {
+            continue;
+        }
+        first_data_row = Some(row);
+        break;
+    }
+
+    let mapping = header_mapper::map(&headers, first_data_row.as_ref());
+    if let Some(name) = &mapping.url_header_override {
+        if let Some(first) = headers.first_mut() {
+            *first = name.clone();
+        }
+    }
+
+    let mut warnings = mapping.warnings.clone();
+    let value_idx = match mode {
+        LookupValueMode::Url => mapping.url.ok_or_else(|| {
+            anyhow!(
+                "could not detect a URL column. Headers seen: {}",
+                headers
+                    .iter()
+                    .map(|s| format!("'{}'", s))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?,
+        LookupValueMode::Keyword => detect_keyword_column(&headers, first_data_row.as_ref(), &mut warnings)
+            .ok_or_else(|| {
+                anyhow!(
+                    "could not detect a keyword/query column. Headers seen: {}",
+                    headers
+                        .iter()
+                        .map(|s| format!("'{}'", s))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?,
+    };
+
+    let mut values = Vec::new();
+    if let Some(row) = first_data_row {
+        if !mapping.skip_first_data_row {
+            push_lookup_value(&mut values, &row, value_idx, mode);
+        }
+    }
+    for row in iter {
+        push_lookup_value(&mut values, &row?, value_idx, mode);
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("upload")
+        .to_string();
+
+    Ok(LookupValues {
+        file_name,
+        row_count: values.len(),
+        column_name: headers.get(value_idx).cloned().unwrap_or_else(|| "Column 1".to_string()),
+        warnings,
+        values,
+    })
 }
 
 fn import_csv(path: &Path) -> Result<Import> {
@@ -86,25 +213,55 @@ where
         }
     }
 
-    let url_idx = mapping.url.ok_or_else(|| {
-        anyhow!(
-            "could not detect a URL column. Headers seen: {}",
-            headers
-                .iter()
-                .map(|s| format!("'{}'", s))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })?;
+    let mut warnings = mapping.warnings.clone();
 
-    let metric_columns: Vec<String> = mapping.metrics.iter().map(|(name, _)| name.clone()).collect();
+    // Try URL column first; fall back to keyword/query column.
+    let (primary_idx, is_keyword_source) = match mapping.url {
+        Some(idx) => (idx, false),
+        None => {
+            match detect_keyword_column(&headers, first_data_row.as_ref(), &mut warnings) {
+                Some(idx) => {
+                    warnings.push(format!(
+                        "Keyword source: using '{}' column with {} metric columns.",
+                        headers.get(idx).map(|s| s.as_str()).unwrap_or("?"),
+                        mapping.metrics.iter().filter(|(_, midx)| *midx != idx).count()
+                    ));
+                    (idx, true)
+                }
+                None => {
+                    return Err(anyhow!(
+                        "could not detect a URL or keyword column. Headers seen: {}",
+                        headers
+                            .iter()
+                            .map(|s| format!("'{}'", s))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
+        }
+    };
+    let url_idx = primary_idx;
+
+    // Rebuild metrics excluding the primary dimension column.
+    let metric_columns: Vec<String> = mapping
+        .metrics
+        .iter()
+        .filter(|(_, idx)| *idx != primary_idx)
+        .map(|(name, _)| name.clone())
+        .collect();
     let metric_indexes: HashMap<String, usize> = metric_columns
         .iter()
         .enumerate()
         .map(|(idx, name)| (name.clone(), idx))
         .collect();
-
-    let mut warnings = mapping.warnings.clone();
+    // Rebuild the (name, idx) pairs for process_row to match the new metric_columns order.
+    let effective_metrics: Vec<(String, usize)> = mapping
+        .metrics
+        .iter()
+        .filter(|(_, idx)| *idx != primary_idx)
+        .cloned()
+        .collect();
     let mut rows = Vec::new();
     let mut by_raw_exact: HashMap<String, Vec<usize>> = HashMap::new();
     let mut by_raw_without_fragment: HashMap<String, Vec<usize>> = HashMap::new();
@@ -123,7 +280,7 @@ where
             process_row(
                 row,
                 url_idx,
-                &mapping.metrics,
+                &effective_metrics,
                 &mut rows,
                 &mut by_raw_exact,
                 &mut by_raw_without_fragment,
@@ -144,7 +301,7 @@ where
         process_row(
             row?,
             url_idx,
-            &mapping.metrics,
+            &effective_metrics,
             &mut rows,
             &mut by_raw_exact,
             &mut by_raw_without_fragment,
@@ -164,33 +321,44 @@ where
         warnings.push("no data rows found after header row".to_string());
     }
 
-    if metric_columns.is_empty() {
+    if metric_columns.is_empty() && !is_keyword_source {
         warnings.push("no metric columns detected — only URL matching will work".to_string());
     }
 
-    let url_kind = if full_like_rows >= path_like_rows {
-        UrlValueKind::FullUrl
+    let (url_kind, export_profile, match_mode, truncation_cap) = if is_keyword_source {
+        (
+            UrlValueKind::PathOnly,
+            ExportProfile::KeywordExport,
+            "KEYWORD_MODE",
+            None,
+        )
     } else {
-        UrlValueKind::PathOnly
-    };
-    let export_profile = classify_export_profile(&mode_sample_values, query_rows);
-    let match_mode = classify_match_mode(export_profile);
-    if match_mode == "MIXED_MODE" {
-        warnings.push(
-            "Mixed export format detected in URL column. Choose FULL_URL_MODE or PATH_MODE manually before lookup."
-                .to_string(),
-        );
-    }
-
-    let raw_truncation_cap = detect_truncation_cap(&headers[url_idx], &raw_length_counts);
-    let truncation_cap =
-        raw_truncation_cap.and_then(|raw_cap| resolve_primary_cap(&rows, url_kind, raw_cap));
-
-    if let (Some(raw_cap), Some(cap)) = (raw_truncation_cap, truncation_cap) {
-        for row in &mut rows {
-            row.likely_truncated = row.raw_length == raw_cap || primary_key_len(row, url_kind) == cap;
+        let kind = if full_like_rows >= path_like_rows {
+            UrlValueKind::FullUrl
+        } else {
+            UrlValueKind::PathOnly
+        };
+        let profile = classify_export_profile(&mode_sample_values, query_rows);
+        let mode = classify_match_mode(profile);
+        if mode == "MIXED_MODE" {
+            warnings.push(
+                "Mixed export format detected in URL column. Choose FULL_URL_MODE or PATH_MODE manually before lookup."
+                    .to_string(),
+            );
         }
-    }
+
+        let raw_truncation_cap = detect_truncation_cap(&headers[url_idx], &raw_length_counts);
+        let cap =
+            raw_truncation_cap.and_then(|raw_cap| resolve_primary_cap(&rows, kind, raw_cap));
+
+        if let (Some(raw_cap), Some(resolved_cap)) = (raw_truncation_cap, cap) {
+            for row in &mut rows {
+                row.likely_truncated =
+                    row.raw_length == raw_cap || primary_key_len(row, kind) == resolved_cap;
+            }
+        }
+        (kind, profile, mode, cap)
+    };
 
     let file_name = path
         .file_name()
@@ -368,6 +536,7 @@ fn classify_match_mode(export_profile: ExportProfile) -> &'static str {
     match export_profile {
         ExportProfile::FullUrl | ExportProfile::FullUrlWithQuery => "FULL_URL_MODE",
         ExportProfile::PathOnly => "PATH_MODE",
+        ExportProfile::KeywordExport => "KEYWORD_MODE",
         ExportProfile::HostAndPath | ExportProfile::Unknown => "MIXED_MODE",
     }
 }
@@ -480,6 +649,190 @@ fn looks_like_header(row: &[String]) -> bool {
     false
 }
 
+fn push_lookup_value(values: &mut Vec<String>, row: &[String], idx: usize, mode: LookupValueMode) {
+    let value = row.get(idx).map(|cell| trim_cell(cell)).unwrap_or_default();
+    if value.is_empty() {
+        return;
+    }
+    if mode == LookupValueMode::Url && !looks_like_url_value(&value) {
+        return;
+    }
+    // Keyword cells in XLSX can contain embedded newlines from word-wrap;
+    // collapse them into single spaces so each cell yields one clean query.
+    let value = if mode == LookupValueMode::Keyword {
+        value.split_whitespace().collect::<Vec<_>>().join(" ")
+    } else {
+        value
+    };
+    if value.is_empty() {
+        return;
+    }
+    values.push(value);
+}
+
+fn looks_like_url_value(value: &str) -> bool {
+    let t = value.trim().to_ascii_lowercase();
+    t.starts_with('/')
+        || t.starts_with("http://")
+        || t.starts_with("https://")
+        || t.starts_with("www.")
+        || t.contains(".com/")
+        || t.contains(".net/")
+        || t.contains(".org/")
+}
+
+fn detect_keyword_column(
+    headers: &[String],
+    first_data_row: Option<&Vec<String>>,
+    warnings: &mut Vec<String>,
+) -> Option<usize> {
+    let normalized_headers: Vec<String> = headers.iter().map(|h| normalize_header(h)).collect();
+    const KEYWORD_ALIASES: &[&str] = &[
+        "query",
+        "queries",
+        "top query",
+        "top queries",
+        "search query",
+        "search queries",
+        "search term",
+        "search terms",
+        "keyword",
+        "keywords",
+    ];
+
+    let exact: Vec<usize> = normalized_headers
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, header)| KEYWORD_ALIASES.contains(&header.as_str()).then_some(idx))
+        .collect();
+    if let Some(first) = exact.first().copied() {
+        if exact.len() > 1 {
+            warnings.push(ambiguous_lookup_column_warning(
+                headers,
+                &exact,
+                first,
+                "keyword/query",
+            ));
+        }
+        return Some(first);
+    }
+
+    let partial: Vec<usize> = normalized_headers
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, header)| {
+            (header.contains("query")
+                || header.contains("keyword")
+                || header.contains("search term")
+                || header.contains("search query"))
+            .then_some(idx)
+        })
+        .collect();
+    if let Some(first) = partial.first().copied() {
+        if partial.len() > 1 {
+            warnings.push(ambiguous_lookup_column_warning(
+                headers,
+                &partial,
+                first,
+                "keyword/query",
+            ));
+        }
+        return Some(first);
+    }
+
+    if let Some(row) = first_data_row {
+        let text_like: Vec<usize> = row
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, cell)| {
+                let trimmed = cell.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                (!is_numeric_cell(trimmed)).then_some(idx)
+            })
+            .collect();
+        if let Some(first) = text_like.first().copied() {
+            if text_like.len() > 1 {
+                warnings.push(ambiguous_lookup_column_warning(
+                    headers,
+                    &text_like,
+                    first,
+                    "text",
+                ));
+            }
+            return Some(first);
+        }
+    }
+
+    headers
+        .iter()
+        .enumerate()
+        .find_map(|(idx, header)| (!header.trim().is_empty()).then_some(idx))
+}
+
+fn normalize_header(s: &str) -> String {
+    s.trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn ambiguous_lookup_column_warning(
+    headers: &[String],
+    candidates: &[usize],
+    chosen: usize,
+    label: &str,
+) -> String {
+    let labels = candidates
+        .iter()
+        .map(|idx| {
+            headers
+                .get(*idx)
+                .map(|header| format!("'{}'", header.trim()))
+                .unwrap_or_else(|| format!("column {}", idx + 1))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let chosen_label = headers
+        .get(chosen)
+        .map(|header| format!("'{}'", header.trim()))
+        .unwrap_or_else(|| format!("column {}", chosen + 1));
+    format!(
+        "multiple {} columns detected ({}); using {}",
+        label, labels, chosen_label
+    )
+}
+
+fn is_numeric_cell(s: &str) -> bool {
+    let t = s.trim().replace(',', "").replace('%', "");
+    !t.is_empty() && t.parse::<f64>().is_ok()
+}
+
+fn headers_look_like_keyword_list(headers: &[String]) -> bool {
+    headers.iter().any(|header| {
+        let normalized = normalize_header(header);
+        matches!(
+            normalized.as_str(),
+            "query"
+                | "queries"
+                | "top query"
+                | "top queries"
+                | "search query"
+                | "search queries"
+                | "search term"
+                | "search terms"
+                | "keyword"
+                | "keywords"
+        ) || normalized.contains("query")
+            || normalized.contains("keyword")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,4 +849,5 @@ mod tests {
         assert!(looks_like_truncation_cap(255));
         assert!(!looks_like_truncation_cap(212));
     }
+
 }

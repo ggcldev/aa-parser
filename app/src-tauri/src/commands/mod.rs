@@ -1,6 +1,7 @@
 use crate::models::{ImportSummary, LookupResponse, UrlListLoad};
 use crate::parser;
 use crate::query::search;
+use crate::query::search::QueryMode;
 use crate::state::AppState;
 use tauri::State;
 
@@ -29,17 +30,43 @@ pub fn list_imports(state: State<'_, AppState>) -> Vec<ImportSummary> {
 pub async fn load_lookup_file(
     _state: State<'_, AppState>,
     path: String,
+    query_mode: Option<String>,
 ) -> Result<UrlListLoad, String> {
-    let import = tauri::async_runtime::spawn_blocking(move || parser::import_path(&path))
+    let mode = match query_mode.as_deref() {
+        Some("keyword") => parser::LookupValueMode::Keyword,
+        _ => parser::LookupValueMode::Url,
+    };
+    let loaded = tauri::async_runtime::spawn_blocking(move || {
+        match parser::load_lookup_values(&path, mode) {
+            Ok(loaded) => Ok(loaded),
+            Err(err) => {
+                // Fallback: if URL mode can't find a URL column, try keyword/query mode.
+                // This handles sources like Search Console exports ("Top queries", etc.).
+                if mode == parser::LookupValueMode::Url {
+                    let msg = format!("{:#}", err);
+                    if msg.contains("could not detect a URL column") {
+                        let mut loaded =
+                            parser::load_lookup_values(&path, parser::LookupValueMode::Keyword)?;
+                        loaded.warnings.push(
+                            "No URL column detected; loaded keyword/query column instead."
+                                .to_string(),
+                        );
+                        return Ok(loaded);
+                    }
+                }
+                Err(err)
+            }
+        }
+    })
         .await
         .map_err(|e| format!("lookup file task failed: {}", e))?
         .map_err(|e| format!("{:#}", e))?;
     Ok(UrlListLoad {
-        file_name: import.summary.file_name.clone(),
-        row_count: import.summary.row_count,
-        url_column: import.summary.url_column.clone(),
-        warnings: import.summary.warnings.clone(),
-        urls: import.rows.into_iter().map(|row| row.source_url).collect(),
+        file_name: loaded.file_name,
+        row_count: loaded.row_count,
+        url_column: loaded.column_name,
+        warnings: loaded.warnings,
+        urls: loaded.values,
     })
 }
 
@@ -65,6 +92,7 @@ pub fn lookup_urls(
     metrics: Vec<String>,
     batch_ids: Option<Vec<String>>,
     match_mode_override: Option<String>,
+    query_mode: Option<String>,
 ) -> Result<LookupResponse, String> {
     let imports = state.imports.read();
     if imports.is_empty() {
@@ -80,11 +108,16 @@ pub fn lookup_urls(
     if imps.is_empty() {
         return Err("select at least one Adobe source".to_string());
     }
-    Ok(search::lookup_multi(
+    let mode = match query_mode.as_deref() {
+        Some("keyword") => QueryMode::Keyword,
+        _ => QueryMode::Url,
+    };
+    Ok(search::lookup_multi_with_mode(
         &imps,
         &urls,
         &metrics,
         match_mode_override,
+        mode,
     ))
 }
 

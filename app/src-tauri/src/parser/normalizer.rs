@@ -13,6 +13,7 @@ pub enum ExportProfile {
     FullUrlWithQuery,
     HostAndPath,
     PathOnly,
+    KeywordExport,
     Unknown,
 }
 
@@ -23,6 +24,7 @@ impl ExportProfile {
             ExportProfile::FullUrlWithQuery => "full_url_with_query_export",
             ExportProfile::HostAndPath => "host_and_path_export",
             ExportProfile::PathOnly => "path_only_export",
+            ExportProfile::KeywordExport => "keyword_export",
             ExportProfile::Unknown => "unknown_export",
         }
     }

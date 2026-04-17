@@ -5,12 +5,21 @@ import {
   api,
   type ImportSummary,
   type LookupHit,
+  type QueryMode,
   type UrlListLoad,
 } from "./api";
 
 type ResultFilter = "all" | "matched" | "none";
 type LoadedUrlFile = Omit<UrlListLoad, "urls"> & { loaded_count: number };
 type BusyPhase = "import_sources" | "load_url_list" | "lookup";
+type TableColumnId =
+  | "input_url"
+  | "match_mode"
+  | "status"
+  | "source"
+  | "matched_adobe_value"
+  | "notes"
+  | `metric:${string}`;
 
 const CHIP_PREVIEW_LIMIT = 300;
 
@@ -37,6 +46,7 @@ export default function App() {
   const [chipDraft, setChipDraft] = createSignal("");
   const [selectedMetrics, setSelectedMetrics] = createSignal<Set<string>>(new Set());
   const [hits, setHits] = createSignal<LookupHit[]>([]);
+  const [queryMode, setQueryMode] = createSignal<QueryMode>("url");
   const [manualMatchMode, setManualMatchMode] = createSignal<"" | "FULL_URL_MODE" | "PATH_MODE">("");
   const [missingMetrics, setMissingMetrics] = createSignal<string[]>([]);
   const [searchedFiles, setSearchedFiles] = createSignal(0);
@@ -49,6 +59,8 @@ export default function App() {
   const [busyStartedAt, setBusyStartedAt] = createSignal<number | null>(null);
   const [busyTick, setBusyTick] = createSignal(0);
   const [expandedDebug, setExpandedDebug] = createSignal<Set<string>>(new Set());
+  const [copiedColumn, setCopiedColumn] = createSignal<TableColumnId | null>(null);
+  let copiedColumnTimer: number | undefined;
 
   const totalRows = createMemo(() =>
     imports().reduce((sum, i) => sum + i.row_count, 0),
@@ -64,9 +76,13 @@ export default function App() {
       case "import_sources":
         return "Importing Adobe export";
       case "load_url_list":
-        return "Loading lookup URL list";
+        return queryMode() === "keyword"
+          ? "Loading keyword query list"
+          : "Loading lookup URL list";
       case "lookup":
-        return "Scanning URLs against Adobe data";
+        return queryMode() === "keyword"
+          ? "Matching keywords against Adobe data"
+          : "Scanning URLs against Adobe data";
       default:
         return "Working";
     }
@@ -76,9 +92,13 @@ export default function App() {
       case "import_sources":
         return "Parsing rows, detecting export profile, and indexing keys.";
       case "load_url_list":
-        return "Extracting URL values from the selected file.";
+        return queryMode() === "keyword"
+          ? "Extracting keyword/query values from the selected file."
+          : "Extracting URL values from the selected file.";
       case "lookup":
-        return "Evaluating strict match priority rules and collecting candidates.";
+        return queryMode() === "keyword"
+          ? "Scanning URL text and finding rows that contain every keyword term."
+          : "Evaluating strict match priority rules and collecting candidates.";
       default:
         return "Please wait.";
     }
@@ -117,6 +137,12 @@ export default function App() {
     setAllMetrics(await api.allMetrics());
   });
 
+  onCleanup(() => {
+    if (copiedColumnTimer) {
+      window.clearTimeout(copiedColumnTimer);
+    }
+  });
+
   async function refreshImports() {
     setImports(await api.listImports());
     const metrics = await api.allMetrics();
@@ -129,6 +155,7 @@ export default function App() {
 
   async function pickSourceFiles() {
     setError(null);
+    setInfo(null);
     try {
       const picked = await open({
         multiple: true,
@@ -140,29 +167,50 @@ export default function App() {
       const paths = Array.isArray(picked) ? picked : [picked];
       beginBusy("import_sources");
       let firstNew: string[] = [];
+      const newSummaries: ImportSummary[] = [];
+      const importFailures: string[] = [];
       for (const p of paths) {
-        const summary = await api.importFile(p);
-        firstNew.push(...summary.metric_columns);
-      }
-      await refreshImports();
-      // Auto-select metrics from the newly added file(s) if user has none yet
-      if (selectedMetrics().size === 0) {
-        const metrics = await api.allMetrics();
-        setSelectedMetrics(new Set(metrics.slice(0, 6)));
-      } else {
-        // Add new metrics not previously seen, up to 6
-        const cur = new Set(selectedMetrics());
-        for (const m of firstNew) {
-          if (cur.size >= 8) break;
-          cur.add(m);
+        try {
+          const summary = await api.importFile(p);
+          firstNew.push(...summary.metric_columns);
+          newSummaries.push(summary);
+        } catch (e: any) {
+          importFailures.push(String(e ?? ""));
         }
-        setSelectedMetrics(cur);
       }
-      setHits([]);
-      setExpandedDebug(new Set());
-      setMissingMetrics([]);
-      setSearchedFiles(0);
-      setResultFilter("all");
+      if (firstNew.length > 0) {
+        await refreshImports();
+        if (selectedMetrics().size === 0) {
+          const metrics = await api.allMetrics();
+          setSelectedMetrics(new Set(metrics.slice(0, 6)));
+        } else {
+          const cur = new Set(selectedMetrics());
+          for (const m of firstNew) {
+            if (cur.size >= 8) break;
+            cur.add(m);
+          }
+          setSelectedMetrics(cur);
+        }
+
+        // Auto-switch to keyword mode when a keyword source is imported
+        const hasKeywordSource = newSummaries.some(
+          (s) => s.export_profile === "keyword_export",
+        );
+        if (hasKeywordSource && queryMode() !== "keyword") {
+          setQueryMode("keyword");
+          setInfo("Keyword source detected — switched to Keyword mode.");
+        }
+
+        setHits([]);
+        setExpandedDebug(new Set());
+        setMissingMetrics([]);
+        setSearchedFiles(0);
+        setResultFilter("all");
+      }
+
+      if (importFailures.length > 0) {
+        setError(importFailures[0]);
+      }
     } catch (e: any) {
       setError(String(e));
     } finally {
@@ -186,7 +234,7 @@ export default function App() {
 
       const loadedFiles: LoadedUrlFile[] = [];
       for (const p of paths) {
-        const loaded = await api.loadLookupFile(p);
+        const loaded = await api.loadLookupFile(p, queryMode());
         addChips(loaded.urls);
         loadedFiles.push({
           file_name: loaded.file_name,
@@ -229,7 +277,18 @@ export default function App() {
     return false;
   }
 
-  function splitUrls(text: string): string[] {
+  function splitInputs(text: string, mode: QueryMode): string[] {
+    if (mode === "keyword") {
+      const primary = text
+        .split(/[\r\n\t]+/)
+        .map((s) => s.trim().replace(/^["']|["']$/g, ""))
+        .filter((s) => s.length > 0);
+      if (primary.length > 0) return primary;
+      return text
+        .split(",")
+        .map((s) => s.trim().replace(/^["']|["']$/g, ""))
+        .filter((s) => s.length > 0);
+    }
     // Split on any line ending or tab (Excel multi-column paste).
     // Do NOT split on `;` — it's a valid URL character (matrix params, jsessionid).
     const primary = text
@@ -254,7 +313,7 @@ export default function App() {
   }
 
   function commitDraft() {
-    const items = splitUrls(chipDraft());
+    const items = splitInputs(chipDraft(), queryMode());
     if (items.length > 0) {
       addChips(items);
       setChipDraft("");
@@ -280,10 +339,18 @@ export default function App() {
 
   function onChipPaste(e: ClipboardEvent) {
     const text = e.clipboardData?.getData("text") ?? "";
-    const items = splitUrls(text);
-    // Only intercept if the paste is multi-line / multi-cell, or contains a
-    // URL-shaped value. Otherwise let the input handle it normally (so the
-    // user can correct a typo in the draft).
+    const items = splitInputs(text, queryMode());
+    // Only intercept if the paste is multi-line / multi-cell (or multiple
+    // parsed entries). Otherwise let the input handle it normally so the user
+    // can edit a single value in the draft box.
+    if (queryMode() === "keyword") {
+      if (/[\r\n\t]/.test(text) || items.length > 1) {
+        e.preventDefault();
+        addChips(items);
+        setChipDraft("");
+      }
+      return;
+    }
     if (/[\r\n\t]/.test(text) || items.length > 1) {
       e.preventDefault();
       addChips(items);
@@ -307,6 +374,17 @@ export default function App() {
     setSelectedMetrics(s);
   }
 
+  function changeQueryMode(mode: QueryMode) {
+    if (queryMode() === mode) return;
+    setQueryMode(mode);
+    setHits([]);
+    setExpandedDebug(new Set());
+    setMissingMetrics([]);
+    setSearchedFiles(0);
+    setResultFilter("all");
+    setError(null);
+  }
+
   async function runLookup() {
     setError(null);
     if (imports().length === 0) {
@@ -317,7 +395,7 @@ export default function App() {
     if (chipDraft().trim()) commitDraft();
     const urls = urlChips();
     if (urls.length === 0) {
-      setError("Add at least one URL.");
+      setError(queryMode() === "keyword" ? "Add at least one keyword query." : "Add at least one URL.");
       return;
     }
     if (hasMixedImports() && !manualMatchMode()) {
@@ -331,6 +409,7 @@ export default function App() {
         [...selectedMetrics()],
         imports().map((imp) => imp.batch_id),
         manualMatchMode() || undefined,
+        queryMode(),
       );
       setHits(resp.hits);
       setExpandedDebug(new Set());
@@ -425,6 +504,98 @@ export default function App() {
     URL.revokeObjectURL(url);
   }
 
+  function columnValue(
+    columnId: TableColumnId,
+    hit: LookupHit,
+    row?: LookupHit["rows"][number],
+  ) {
+    if (columnId === "input_url") return asDisplayValue(hit.query);
+    if (columnId === "match_mode") return asDisplayValue(hit.match_mode);
+    if (columnId === "status") return asDisplayValue(hit.status);
+    if (columnId === "source") return asDisplayValue(row?.source_file);
+    if (columnId === "matched_adobe_value") return asDisplayValue(row?.source_url);
+    if (columnId === "notes") return asDisplayValue(hit.notes);
+    if (columnId.startsWith("metric:")) {
+      const metric = columnId.slice("metric:".length);
+      return asDisplayValue(row?.metrics[metric]);
+    }
+    return "-";
+  }
+
+  function collectColumnText(columnId: TableColumnId) {
+    // Columns that are per-hit (same for every matched row) vs per-row (differ per match).
+    const perHit = columnId === "input_url" || columnId === "match_mode" || columnId === "status" || columnId === "notes";
+    const lines: string[] = [];
+    for (const h of filteredHits()) {
+      if (h.rows.length === 0) {
+        lines.push(columnValue(columnId, h));
+        continue;
+      }
+      if (perHit) {
+        lines.push(columnValue(columnId, h, h.rows[0]));
+      } else {
+        for (const r of h.rows) {
+          lines.push(columnValue(columnId, h, r));
+        }
+      }
+    }
+    return lines.join("\n");
+  }
+
+  async function writeToClipboard(text: string) {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    if (!ok) {
+      throw new Error("Clipboard copy failed.");
+    }
+  }
+
+  async function copyColumn(columnId: TableColumnId) {
+    setError(null);
+    try {
+      await writeToClipboard(collectColumnText(columnId));
+      setCopiedColumn(columnId);
+      if (copiedColumnTimer) window.clearTimeout(copiedColumnTimer);
+      copiedColumnTimer = window.setTimeout(() => setCopiedColumn(null), 1500);
+    } catch (e: any) {
+      setError(String(e));
+    }
+  }
+
+  function asDisplayValue(value: string | null | undefined) {
+    const cleaned = (value ?? "").trim();
+    if (!cleaned) return "-";
+    if (/^n\/?a$/i.test(cleaned)) return "-";
+    return cleaned;
+  }
+
+  function renderHeader(label: string, columnId: TableColumnId) {
+    return (
+      <div class="th-copy-wrap">
+        <span>{label}</span>
+        <button
+          class={`th-copy-btn ${copiedColumn() === columnId ? "copied" : ""}`}
+          onClick={() => copyColumn(columnId)}
+          type="button"
+          title={`Copy "${label}" column as text`}
+        >
+          {copiedColumn() === columnId ? "Copied" : "Copy"}
+        </button>
+      </div>
+    );
+  }
+
   function csv(s: string) {
     if (s.includes(",") || s.includes('"') || s.includes("\n")) {
       return '"' + s.replace(/"/g, '""') + '"';
@@ -464,7 +635,7 @@ export default function App() {
     if (status === "Duplicate exact matches found" || status === "Mixed export format") {
       return "warn";
     }
-    if (status === "No exact match found" || status === "Invalid URL") {
+    if (status === "No exact match found" || status === "No keyword match found" || status === "Invalid URL") {
       return "neutral";
     }
     return "neutral";
@@ -527,12 +698,12 @@ export default function App() {
           </div>
 
           <div>
-            <div class="section-title">Loaded Adobe sources ({imports().length})</div>
+            <div class="section-title">Loaded sources ({imports().length})</div>
             <Show
               when={imports().length > 0}
               fallback={
                 <div style={{ "font-size": "11.5px", color: "var(--muted)", padding: "4px 4px" }}>
-                  No Adobe sources yet.
+                  No sources loaded yet.
                 </div>
               }
             >
@@ -555,7 +726,7 @@ export default function App() {
                       {fmtNum(imp.row_count)} rows · {imp.metric_columns.length} metrics
                     </div>
                     <div class="sub">
-                      {describeImportShape(imp)} · URL column: {imp.url_column}
+                      {describeImportShape(imp)} · {imp.export_profile === "keyword_export" ? "Keyword column" : "URL column"}: {imp.url_column}
                     </div>
                     <Show when={imp.warnings.length > 0}>
                       <div class="warn">{imp.warnings.join(" · ")}</div>
@@ -599,15 +770,36 @@ export default function App() {
 
         <section class="content">
           <Show
-            when={imports().length > 0}
+            when={imports().length > 0 || urlChips().length > 0 || loadedUrlFiles().length > 0}
             fallback={
               <div class="empty">
                 <div class="icon">📊</div>
                 <h3>No Adobe sources loaded</h3>
                 <p>
-                  Add one or more Adobe Analytics exports on the left. Then paste URLs
-                  or load a URL list file to cross-check them against the loaded exports.
+                  Add one or more Adobe Analytics exports on the left, or load a
+                  keyword/URL list file to get started.
                 </p>
+                <div class="row" style={{ "justify-content": "center", "margin-top": "8px" }}>
+                  <button
+                    class={`ghost compact ${queryMode() === "url" ? "active" : ""}`}
+                    onClick={() => changeQueryMode("url")}
+                    disabled={busy()}
+                  >
+                    URL mode
+                  </button>
+                  <button
+                    class={`ghost compact ${queryMode() === "keyword" ? "active" : ""}`}
+                    onClick={() => changeQueryMode("keyword")}
+                    disabled={busy()}
+                  >
+                    Keyword mode
+                  </button>
+                </div>
+                <div class="row" style={{ "justify-content": "center", "margin-top": "8px" }}>
+                  <button class="ghost" onClick={pickLookupFiles} disabled={busy()}>
+                    {queryMode() === "keyword" ? "Load keyword list file" : "Load URL list file"}
+                  </button>
+                </div>
               </div>
             }
           >
@@ -640,11 +832,32 @@ export default function App() {
 
             <div class="card">
               <h2>
-                URL List
+                {queryMode() === "keyword" ? "Keyword Query List" : "URL List"}
                 <Show when={urlChips().length > 0}>
                   <span class="count-pill">{urlChips().length}</span>
                 </Show>
               </h2>
+              <div class="row" style={{ "margin-bottom": "10px" }}>
+                <button
+                  class={`ghost compact ${queryMode() === "url" ? "active" : ""}`}
+                  onClick={() => changeQueryMode("url")}
+                  disabled={busy()}
+                >
+                  URL mode
+                </button>
+                <button
+                  class={`ghost compact ${queryMode() === "keyword" ? "active" : ""}`}
+                  onClick={() => changeQueryMode("keyword")}
+                  disabled={busy()}
+                >
+                  Keyword mode
+                </button>
+              </div>
+              <Show when={queryMode() === "keyword"}>
+                <div class="subtle-note" style={{ "margin-bottom": "8px" }}>
+                  Keyword mode matches rows whose URL text contains all terms in each query.
+                </div>
+              </Show>
               <div class="chip-input" onClick={(e) => {
                 const input = (e.currentTarget as HTMLElement).querySelector("input");
                 input?.focus();
@@ -672,8 +885,12 @@ export default function App() {
                   value={chipDraft()}
                   placeholder={
                     urlChips().length === 0
-                      ? "Paste URLs (new lines or tabs) — Enter to add"
-                      : "Add another…"
+                      ? queryMode() === "keyword"
+                        ? "Paste keywords (new lines or tabs) — Enter to add"
+                        : "Paste URLs (new lines or tabs) — Enter to add"
+                      : queryMode() === "keyword"
+                        ? "Add another keyword…"
+                        : "Add another URL…"
                   }
                   onInput={(e) => setChipDraft(e.currentTarget.value)}
                   onKeyDown={onChipKeyDown}
@@ -683,8 +900,9 @@ export default function App() {
               </div>
               <Show when={hiddenChipCount() > 0}>
                 <div class="subtle-note">
-                  Showing first {fmtNum(CHIP_PREVIEW_LIMIT)} URLs only. Lookup still uses all{" "}
-                  {fmtNum(urlChips().length)} loaded URLs.
+                  Showing first {fmtNum(CHIP_PREVIEW_LIMIT)} {queryMode() === "keyword" ? "queries" : "URLs"} only.
+                  Lookup still uses all {fmtNum(urlChips().length)} loaded{" "}
+                  {queryMode() === "keyword" ? "queries" : "URLs"}.
                 </div>
               </Show>
               <Show when={loadedUrlFiles().length > 0}>
@@ -693,7 +911,8 @@ export default function App() {
                     {(loaded) => (
                       <div class="file-note">
                         <div>
-                          {loaded.file_name} · {fmtNum(loaded.loaded_count)} URLs · column{" "}
+                          {loaded.file_name} · {fmtNum(loaded.loaded_count)}{" "}
+                          {queryMode() === "keyword" ? "queries" : "URLs"} · column{" "}
                           {loaded.url_column}
                         </div>
                         <Show when={loaded.warnings.length > 0}>
@@ -705,13 +924,19 @@ export default function App() {
                 </div>
               </Show>
               <div class="row" style={{ "margin-top": "12px" }}>
-                <button class="ghost" onClick={pickLookupFiles} disabled={busy()}>
-                  Load URL list file
+                <button
+                  class="ghost"
+                  onClick={pickLookupFiles}
+                  disabled={busy()}
+                >
+                  {queryMode() === "keyword" ? "Load keyword list file" : "Load URL list file"}
                 </button>
-                <button onClick={runLookup} disabled={busy()}>
+                <button onClick={runLookup} disabled={busy() || imports().length === 0}>
                   {busy() && busyPhase() === "lookup"
                     ? "Scanning…"
-                    : `Look up against ${imports().length} Adobe source${imports().length === 1 ? "" : "s"}`}
+                    : imports().length === 0
+                      ? "Add an Adobe source first"
+                      : `${queryMode() === "keyword" ? "Match keywords against" : "Look up against"} ${imports().length} Adobe source${imports().length === 1 ? "" : "s"}`}
                 </button>
                 <Show when={hits().length > 0}>
                   <button class="ghost" onClick={exportCsv}>
@@ -774,15 +999,17 @@ export default function App() {
                   <table>
                     <thead>
                       <tr>
-                        <th>Input URL</th>
-                        <th>Match mode</th>
-                        <th>Status</th>
+                        <th>{renderHeader(queryMode() === "keyword" ? "Input query" : "Input URL", "input_url")}</th>
+                        <th>{renderHeader("Match mode", "match_mode")}</th>
+                        <th>{renderHeader("Status", "status")}</th>
                         <Show when={showMultiFile()}>
-                          <th>Source</th>
+                          <th>{renderHeader("Source", "source")}</th>
                         </Show>
-                        <th>Matched Adobe value</th>
-                        <For each={[...selectedMetrics()]}>{(m) => <th>{m}</th>}</For>
-                        <th>Notes</th>
+                        <th>{renderHeader("Matched Adobe value", "matched_adobe_value")}</th>
+                        <For each={[...selectedMetrics()]}>
+                          {(m) => <th>{renderHeader(m, `metric:${m}`)}</th>}
+                        </For>
+                        <th>{renderHeader("Notes", "notes")}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -793,7 +1020,7 @@ export default function App() {
                               when={h.rows.length > 0}
                               fallback={
                                 <tr class="miss">
-                                  <td class="url-cell">
+                                  <td class={queryMode() === "keyword" ? "keyword-cell" : "url-cell"}>
                                     {h.query}
                                   </td>
                                   <td>{h.match_mode}</td>
@@ -807,36 +1034,49 @@ export default function App() {
                                     </button>
                                   </td>
                                   <Show when={showMultiFile()}>
-                                    <td>—</td>
+                                    <td>-</td>
                                   </Show>
-                                  <td>—</td>
-                                  <For each={[...selectedMetrics()]}>{() => <td>—</td>}</For>
-                                  <td>{h.notes || "—"}</td>
+                                  <td>-</td>
+                                  <For each={[...selectedMetrics()]}>{() => <td>-</td>}</For>
+                                  <td>{asDisplayValue(h.notes)}</td>
                                 </tr>
                               }
                             >
                               <For each={h.rows}>
-                                {(r) => (
+                                {(r, rowIdx) => (
                                   <tr class={h.ambiguous ? "amb" : ""}>
-                                    <td class="url-cell">{h.query}</td>
-                                    <td>{h.match_mode}</td>
-                                    <td>
-                                      <span class={`badge ${badgeClass(h.status)}`}>{h.status}</span>
-                                      <button
-                                        class="debug-btn"
-                                        onClick={() => toggleDebug(h, hitIndex())}
+                                    {rowIdx() === 0 && (
+                                      <td
+                                        class={queryMode() === "keyword" ? "keyword-cell" : "url-cell"}
+                                        rowSpan={h.rows.length}
                                       >
-                                        {isDebugExpanded(h, hitIndex()) ? "Hide debug" : "Show debug"}
-                                      </button>
-                                    </td>
+                                        {h.query}
+                                      </td>
+                                    )}
+                                    {rowIdx() === 0 && (
+                                      <td rowSpan={h.rows.length}>{h.match_mode}</td>
+                                    )}
+                                    {rowIdx() === 0 && (
+                                      <td rowSpan={h.rows.length}>
+                                        <span class={`badge ${badgeClass(h.status)}`}>{h.status}</span>
+                                        <button
+                                          class="debug-btn"
+                                          onClick={() => toggleDebug(h, hitIndex())}
+                                        >
+                                          {isDebugExpanded(h, hitIndex()) ? "Hide debug" : "Show debug"}
+                                        </button>
+                                      </td>
+                                    )}
                                     <Show when={showMultiFile()}>
-                                      <td class="src-cell">{r.source_file ?? ""}</td>
+                                      <td class="src-cell">{asDisplayValue(r.source_file)}</td>
                                     </Show>
-                                    <td class="url-cell">{r.source_url}</td>
+                                    <td class="url-cell">{asDisplayValue(r.source_url)}</td>
                                     <For each={[...selectedMetrics()]}>
-                                      {(m) => <td>{r.metrics[m] ?? "—"}</td>}
+                                      {(m) => <td>{asDisplayValue(r.metrics[m])}</td>}
                                     </For>
-                                    <td>{h.notes || "—"}</td>
+                                    {rowIdx() === 0 && (
+                                      <td rowSpan={h.rows.length}>{asDisplayValue(h.notes)}</td>
+                                    )}
                                   </tr>
                                 )}
                               </For>

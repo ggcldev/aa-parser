@@ -12,6 +12,7 @@ export type ImportSummary = {
     | "full_url_with_query_export"
     | "host_and_path_export"
     | "path_only_export"
+    | "keyword_export"
     | "unknown_export";
   truncation_cap?: number;
   metric_columns: string[];
@@ -41,7 +42,7 @@ export type Row = {
 export type LookupHit = {
   query: string;
   normalized_query: string;
-  match_mode: "FULL_URL_MODE" | "PATH_MODE" | "MIXED_MODE";
+  match_mode: "FULL_URL_MODE" | "PATH_MODE" | "MIXED_MODE" | "KEYWORD_MODE";
   status: string;
   notes: string;
   matched: boolean;
@@ -61,22 +62,27 @@ export type LookupResponse = {
   searched_files: number;
 };
 
+export type QueryMode = "url" | "keyword";
+
 export const api = {
   importFile: (path: string) => invoke<ImportSummary>("import_file", { path }),
   listImports: () => invoke<ImportSummary[]>("list_imports"),
-  loadLookupFile: (path: string) => invoke<UrlListLoad>("load_lookup_file", { path }),
+  loadLookupFile: (path: string, queryMode?: QueryMode) =>
+    invoke<UrlListLoad>("load_lookup_file", { path, queryMode }),
   allMetrics: () => invoke<string[]>("all_metrics"),
   lookupUrls: (
     urls: string[],
     metrics: string[],
     batchIds?: string[],
     matchModeOverride?: "FULL_URL_MODE" | "PATH_MODE",
+    queryMode?: QueryMode,
   ) =>
     invoke<LookupResponse>("lookup_urls", {
       urls,
       metrics,
       batchIds,
       matchModeOverride,
+      queryMode,
     }),
   removeImport: (batchId: string) =>
     invoke<void>("remove_import", { batchId }),
