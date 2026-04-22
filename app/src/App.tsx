@@ -281,6 +281,30 @@ export default function App() {
     return !s || /^n\/?a$/i.test(s) ? "-" : s;
   }
 
+  async function copyColumn(col: TableColumnId) {
+    const rows = filteredHits();
+    const lines: string[] = [];
+    const metricName = col.startsWith("metric:") ? col.slice("metric:".length) : null;
+    for (const h of rows) {
+      if (col === "input_url") { lines.push(h.query); continue; }
+      if (col === "status") { lines.push(h.status); continue; }
+      if (col === "notes") { lines.push(asDisplayValue(h.notes)); continue; }
+      if (metricName) {
+        if (h.rows.length === 0) { lines.push("-"); continue; }
+        for (const r of h.rows) lines.push(asDisplayValue(r.metrics[metricName]));
+        continue;
+      }
+    }
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"));
+      setCopiedColumn(col);
+      if (copiedColumnTimer) window.clearTimeout(copiedColumnTimer);
+      copiedColumnTimer = window.setTimeout(() => setCopiedColumn(null), 1200);
+    } catch (e: any) {
+      setError("Copy failed: " + String(e));
+    }
+  }
+
   function csv(s: string) {
     if (s.includes(",") || s.includes('"') || s.includes("\n")) return '"' + s.replace(/"/g, '""') + '"';
     return s;
@@ -417,7 +441,17 @@ export default function App() {
                           </span>
                         )}
                       </For>
-                      <input type="text" class="chip-draft" value={chipDraft()} placeholder="Paste or type..." onInput={e => setChipDraft(e.currentTarget.value)} onKeyDown={e => e.key === "Enter" && commitDraft()} onBlur={commitDraft} />
+                      <input type="text" class="chip-draft" value={chipDraft()} placeholder="Paste or type..." onInput={e => setChipDraft(e.currentTarget.value)} onKeyDown={e => e.key === "Enter" && commitDraft()} onBlur={commitDraft} onPaste={e => {
+                        const text = e.clipboardData?.getData("text") ?? "";
+                        if (/[\r\n\t]/.test(text)) {
+                          e.preventDefault();
+                          const items = splitInputs(text, queryMode());
+                          if (items.length > 0) {
+                            addChips(items);
+                            setChipDraft("");
+                          }
+                        }
+                      }} />
                     </div>
                     <div class="toolbar-group">
                       <button class="ghost compact" onClick={pickLookupFiles}>Import File</button>
@@ -456,10 +490,13 @@ export default function App() {
                         <table>
                           <thead>
                             <tr>
-                              <th>Input</th>
-                              <th>Status</th>
-                              <For each={[...selectedMetrics()]}>{(m) => <th>{m}</th>}</For>
-                              <th>Notes</th>
+                              <th><div class="th-content"><span>Input</span><button class="col-copy" title="Copy column" onClick={() => copyColumn("input_url")}>{copiedColumn() === "input_url" ? "✓" : "⎘"}</button></div></th>
+                              <th><div class="th-content"><span>Status</span><button class="col-copy" title="Copy column" onClick={() => copyColumn("status")}>{copiedColumn() === "status" ? "✓" : "⎘"}</button></div></th>
+                              <For each={[...selectedMetrics()]}>{(m) => {
+                                const id: TableColumnId = `metric:${m}`;
+                                return <th><div class="th-content"><span>{m}</span><button class="col-copy" title="Copy column" onClick={() => copyColumn(id)}>{copiedColumn() === id ? "✓" : "⎘"}</button></div></th>;
+                              }}</For>
+                              <th><div class="th-content"><span>Notes</span><button class="col-copy" title="Copy column" onClick={() => copyColumn("notes")}>{copiedColumn() === "notes" ? "✓" : "⎘"}</button></div></th>
                             </tr>
                           </thead>
                           <tbody>
